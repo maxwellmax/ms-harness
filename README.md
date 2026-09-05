@@ -270,7 +270,7 @@ Any violation aborts, quoting the offending line, with a non-zero exit code.
 
 | Flag | Meaning |
 |---|---|
-| `--engine codex\|claude` | implementation engine (default: `codex`) |
+| `--engine codex\|claude` | implementation engine (default: `claude`) |
 | `--test-cmd "<cmd>"` | the consumer project's test command, for the suite gate |
 | `--max-cycles N` | correction cycles per issue (default: `3`) |
 | `--no-verify` | disable the verifier gate (equivalent to `MS_LOOP_VERIFY=off`) |

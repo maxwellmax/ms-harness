@@ -26,7 +26,7 @@
 #   scripts/loop.sh [options] [path-to-issue-document]
 #
 # Options:
-#   --engine codex|claude    implementation engine (default: codex)
+#   --engine codex|claude    implementation engine (default: claude)
 #   --test-cmd "<cmd>"       the consumer project's test command (suite gate)
 #   --max-cycles N           correction cycles per issue (default: 3)
 #   --no-verify              disable the verifier gate (= MS_LOOP_VERIFY=off)
@@ -186,7 +186,7 @@
 #
 set -euo pipefail
 
-ENGINE="codex"
+ENGINE="claude"
 INPUT_FILE=""
 INPUT_RULE=""
 TEST_CMD_FLAG=""
