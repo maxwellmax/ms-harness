@@ -40,7 +40,7 @@ pointing the marketplace at the checkout path.
 
 All commands are plugin-namespaced: they resolve as `/ms-harness:<name>`.
 
-Installation is configuration-free: after installing, `/ms-harness:plan` runs in a
+Installation is configuration-free: after installing, `/ms-harness:spec` runs in a
 consumer project without a single pre-existing file having to be created or edited
 first. Installing the plugin also changes the semantics of no Claude Code tool —
 the harness acts only when an `ms-harness:` command or the loop script is invoked
@@ -52,7 +52,7 @@ The plugin ships exactly these commands. There is no unlisted embedded command.
 
 | Command | What it does | Writes |
 |---|---|---|
-| `/ms-harness:plan` | Planning pipeline for one feature | `.spec/features/<slug>/` |
+| `/ms-harness:spec` | Planning pipeline for one feature | `.spec/features/<slug>/` |
 | `/ms-harness:ai-context` | Generates or refreshes the AGENTS context tree | `AGENTS.md`, `CLAUDE.md`, `docs/agents/*.md` |
 | `/ms-harness:init` | Reports the state of the init spec chain and runs its next step | nothing (router) |
 | `/ms-harness:init:project-description` | Interviews the developer into a project description | `.spec/init/project-description.md` |
@@ -60,10 +60,10 @@ The plugin ships exactly these commands. There is no unlisted embedded command.
 | `/ms-harness:init:database-schema` | Derives a suggested schema in DBML | `.spec/init/database-schema.md` |
 | `/ms-harness:init:project-issues` | Cuts the whole build into numbered vertical slices | `.spec/init/project-issues.md` |
 
-### `/ms-harness:plan`
+### `/ms-harness:spec`
 
 ```
-/ms-harness:plan <description | path-to-description-file>
+/ms-harness:spec <description | path-to-description-file>
 ```
 
 A thin router over four agents. It normalizes the input, checks preconditions,
@@ -399,14 +399,14 @@ git init
    `.spec/init/design/` first — that directory is always yours, and the fourth
    command reads it.)
 
-   You can skip straight to step 2 instead: `/ms-harness:plan` runs in a bare
+   You can skip straight to step 2 instead: `/ms-harness:spec` runs in a bare
    project, tells you exactly what is missing and which command produces it, and
    continues only after you decide.
 
 2. **Plan a feature.**
 
    ```
-   /ms-harness:plan add a public health endpoint returning build metadata
+   /ms-harness:spec add a public health endpoint returning build metadata
    ```
 
    The pipeline produces `.spec/features/<slug>/SPEC.md`, `PLAN.md`, `ISSUES.md`
@@ -504,7 +504,7 @@ names git as a hard precondition and commits once per completed issue. Publishin
 to a tracker is likewise narrowed — creation only, destination resolved at run
 time from `gh repo view`, never an embedded `owner/repo`.
 
-Kept as they were: the `/plan` pipeline shape, `/ai-context` and its ten
+Kept as they were: the `/ms-harness:spec` pipeline shape, `/ai-context` and its ten
 artifacts, the init chain with its `sha256` staleness stamps, one fresh session
 per unit of work, zero questions during a run, and the rule that the engine exit
 code is never a completion verdict.

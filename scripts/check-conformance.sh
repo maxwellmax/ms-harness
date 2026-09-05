@@ -224,7 +224,7 @@ assert_empty "no file on the surface names the mirrored harness's marketplace" "
 # asserting it.
 #
 # Two delegation shapes are rejected:
-#   1. a slash command written bare — `/plan` instead of `/ms-harness:plan`;
+#   1. a slash command written bare — `/spec` instead of `/ms-harness:spec`;
 #      the namespaced form reads `/ms-harness:` before the name, so it cannot
 #      match.
 #   2. a subagent named bare inside backticks — `issuer` instead of
@@ -329,16 +329,16 @@ fi
 
 block "AC-05 — bare-project entry point and missing-architecture propagation"
 
-if [ -f commands/plan.md ]; then
+if [ -f commands/spec.md ]; then
   for anchor in 'architecture_reference_status: missing' 'Bootstrap and proceed' 'only after an explicit decision'; do
-    if grep -qF -- "$anchor" commands/plan.md; then
-      pass "commands/plan.md documents: $anchor"
+    if grep -qF -- "$anchor" commands/spec.md; then
+      pass "commands/spec.md documents: $anchor"
     else
-      bad "commands/plan.md documents: $anchor" "anchor not found"
+      bad "commands/spec.md documents: $anchor" "anchor not found"
     fi
   done
 else
-  bad "commands/plan.md exists" "file not found"
+  bad "commands/spec.md exists" "file not found"
 fi
 
 MISSING_STATUS=""

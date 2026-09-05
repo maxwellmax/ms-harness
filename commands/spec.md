@@ -4,7 +4,7 @@ argument-hint: "<description | path-to-description-file>"
 allowed-tools: Task, Agent, Read, Write, Glob, Grep, Bash, AskUserQuestion
 ---
 
-# ms-harness:plan
+# ms-harness:spec
 
 You are the router and orchestrator for the planning pipeline. You normalize the input, verify preconditions, delegate specification, decomposition and issue emission to agents, own every human checkpoint, verify artifacts on disk, and report. You never author SPEC / PLAN / issue content yourself — all template knowledge lives in the agents.
 
@@ -116,7 +116,7 @@ Resolve the reference set with the first rule that matches:
 **Bare project — neither `.spec/` nor an AGENTS tree.** This is a supported entry point, never a failure. Do not plan around the gap in silence and do not decide for the developer. Present both options with `AskUserQuestion` and proceed **only after an explicit decision**:
 
 - **Bootstrap and proceed** — create `.spec/features/[slug]/.handoff/` yourself and continue with `architecture_reference_status: missing`. Nothing outside `.spec/` is created.
-- **Produce a reference first** — emit this table, naming every missing reference **and the command that produces it**, then let the developer run one and re-invoke `/ms-harness:plan`:
+- **Produce a reference first** — emit this table, naming every missing reference **and the command that produces it**, then let the developer run one and re-invoke `/ms-harness:spec`:
 
   | Missing reference | Produced by |
   |---|---|
@@ -305,6 +305,6 @@ The handoff always points at `ISSUES.md` and the loop invocation, and at nothing
 - **Never write application code.** The pipeline writes only under `.spec/features/[slug]/`, and this router writes only under `.spec/features/[slug]/.handoff/` — the approval record, the resolved answers file, and nothing else.
 - **No git write command, ever** — nothing that stages, records, stashes, switches, resets, publishes, tags or names a ref, and no commit created by any other means. Read-only probes such as `git diff` and `git status` are fine. The developer reviews the diff and records history manually. The execution loop is a different program under `scripts/`, and this rule does not reach it.
 - **Create only in the tracker** — never close, reopen, relabel or edit an issue this run did not create, the parent included.
-- Scope grows mid-run → stop, propose splitting into smaller features, and re-run `/ms-harness:plan` per slice.
+- Scope grows mid-run → stop, propose splitting into smaller features, and re-run `/ms-harness:spec` per slice.
 - Architecture references loaded → `SPEC.md` and `PLAN.md` MUST name those files and the concrete layering and delegation rules they impose. None available → warning in every artifact, never silence.
 - **No secrets** — never read `.env` or any equivalent, and never let a token, credential or connection string reach an artifact, an issue body or a log line.
