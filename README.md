@@ -37,7 +37,7 @@ portable helper that accepts either `sha256sum` or `shasum -a 256`.
 Add the marketplace and install the plugin:
 
 ```
-/plugin marketplace add <owner>/ms-harness
+/plugin marketplace add maxwellmax/ms-harness
 /plugin install ms-harness
 ```
 
