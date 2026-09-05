@@ -17,6 +17,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SELF="$ROOT/scripts/test-loop.sh"
 LOOP="${MS_LOOP_BIN:-$ROOT/scripts/loop.sh}"
 CHECK_SHELL="$ROOT/scripts/check-shell.sh"
 ONLY="${1:-}"
@@ -76,6 +77,14 @@ assert_not_contains() {
     bad "$3 (found '$2')"
   else
     ok "$3"
+  fi
+}
+
+assert_same_file() {
+  if cmp -s "$1" "$2"; then
+    ok "$3"
+  else
+    bad "$3 ($1 and $2 differ)"
   fi
 }
 
@@ -259,12 +268,26 @@ new_fixture() {
   RUN_PATH=""
 }
 
+# A fixture repository that owes nothing to the host. The developer's global
+# ignore file is neutralised: a machine whose ~/.config/git/ignore happens to
+# list `.spec/` must never be the reason this suite is green. The exclusion of
+# the planning artifacts is then written into the fixture itself, so it is the
+# same on every host.
+#
+# `.spec/` stays out of the fixture's commit surface on purpose: it carries the
+# loop's input document and the loop's state directory, so a case may edit a
+# slice body between two runs without tripping the clean-tree precondition of
+# RF-35b. That is a property of the FIXTURE — the dirty-tree case proves the
+# precondition itself with paths outside `.spec/`.
 git_init_fixture() {
+  : > "$TMP/no-global-ignore"
   (
     cd "$FIX" || exit 1
     git init -q .
     git config user.email harness@example.test
     git config user.name harness
+    git config core.excludesFile "$TMP/no-global-ignore"
+    printf '.spec/\n' > .git/info/exclude
     echo "fixture" > README.md
     git add -A
     git commit -qm "fixture: initial commit"
@@ -360,10 +383,153 @@ This trailing document section belongs to no slice.
 DOC
 }
 
-standard_fixture() {
-  new_fixture "$1"
+# A `.ms-harness.conf` declaring the consumer project's test command — the
+# primary, stack-agnostic source of RF-17. Written at the invocation directory,
+# which is the only place the loop looks for it.
+write_ms_conf() {
+  printf 'test_cmd=%s\n' "$1" > "${RUN_DIR:-$FIX}/.ms-harness.conf"
+}
+
+# One manifest of the fallback table, at the invocation directory. `<file>` and
+# `<content>` are data: the suite never branches on which manifest it just
+# wrote, exactly as the loop never does (RF-18).
+write_manifest() {
+  printf '%s\n' "$2" > "${RUN_DIR:-$FIX}/$1"
+}
+
+# The fixture builder: a git repository carrying an issue document built from a
+# given graph, plus whichever optional artifacts the case asks for.
+#
+#   build_fixture <name> [document] [--init] [--conf <cmd>] [--manifest <f>=<c>]...
+#
+#   --standard          the three-slice CT-01 document (the default)
+#   --single <n>        a one-slice document with <n> acceptance criteria
+#   --graph <spec>      repeatable; one slice per spec, each spec being
+#                       "<number>|<title>|<Blocked by>|<Issue field>"
+#   --graph-list <l>    the same specs already joined into a newline list, for
+#                       a caller that has them in a variable rather than in
+#                       literal arguments (no array is used anywhere: the
+#                       supported bash is 3.2, per RNF-10)
+#   --init              write the document to .spec/init/project-issues.md
+#                       instead of .spec/features/demo/ISSUES.md, so the init
+#                       chain artifact of RF-08 is built by this same builder
+#   --conf <cmd>        a .ms-harness.conf declaring <cmd> as the test command
+#   --manifest <f>=<c>  repeatable; a manifest file <f> carrying content <c>
+#
+# Whatever the options wrote outside `.spec/` is committed before returning,
+# because the loop refuses a dirty work tree (RF-35b).
+build_fixture() {
+  bf_name="$1"
+  shift
+  bf_doc="standard"
+  bf_criteria=1
+  bf_graph=""
+  bf_init=0
+  bf_conf=""
+  bf_manifests=""
+  bf_extra=0
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --standard) bf_doc="standard"; shift ;;
+      --single) bf_doc="single"; bf_criteria="$2"; shift 2 ;;
+      --graph)
+        bf_doc="graph"
+        bf_graph="$bf_graph$2
+"
+        shift 2
+        ;;
+      --graph-list)
+        bf_doc="graph"
+        bf_graph="$bf_graph$2"
+        shift 2
+        ;;
+      --init) bf_init=1; shift ;;
+      --conf) bf_conf="$2"; bf_extra=1; shift 2 ;;
+      --manifest)
+        bf_manifests="$bf_manifests$2
+"
+        bf_extra=1
+        shift 2
+        ;;
+      *)
+        echo "build_fixture: unknown option '$1'" >&2
+        return 1
+        ;;
+    esac
+  done
+
+  new_fixture "$bf_name"
   git_init_fixture
-  write_standard_issues "$FIX/.spec/features/demo/ISSUES.md"
+
+  if [ "$bf_init" -eq 1 ]; then
+    bf_target="$FIX/.spec/init/project-issues.md"
+  else
+    bf_target="$FIX/.spec/features/demo/ISSUES.md"
+  fi
+
+  case "$bf_doc" in
+    standard) write_standard_issues "$bf_target" ;;
+    single) write_single_issue "$bf_target" "$bf_criteria" ;;
+    graph)
+      bf_specs=""
+      while IFS= read -r bf_line; do
+        [ -n "$bf_line" ] || continue
+        bf_specs="$bf_specs$bf_line
+"
+      done <<GRAPH
+$bf_graph
+GRAPH
+      write_graph_issues_from_list "$bf_target" "$bf_specs"
+      ;;
+  esac
+
+  [ -n "$bf_conf" ] && write_ms_conf "$bf_conf"
+
+  while IFS= read -r bf_entry; do
+    [ -n "$bf_entry" ] || continue
+    write_manifest "${bf_entry%%=*}" "${bf_entry#*=}"
+  done <<MANIFESTS
+$bf_manifests
+MANIFESTS
+
+  [ "$bf_extra" -eq 1 ] && commit_fixture
+  return 0
+}
+
+# The single malformed document of the format contract: a level-2 heading that
+# reads like a slice heading but is not one, on line 13. It is written by ONE
+# function because RF-08 requires the init chain artifact to go through exactly
+# the same validation as `ISSUES.md` — the case for it may not use a document of
+# its own, or it would be proving something weaker than the requirement.
+write_malformed_issues() {
+  wmi_target="$1"
+  mkdir -p "$(dirname "$wmi_target")"
+  cat > "$wmi_target" <<'DOC'
+# Issues: broken
+
+## Slice 1: [feat] Fine
+
+- **Blocked by**: nenhum
+
+### Corpo
+
+Body.
+
+---
+
+## Slice two: [feat] Broken
+
+- **Blocked by**: nenhum
+
+### Corpo
+
+Body.
+DOC
+}
+
+standard_fixture() {
+  build_fixture "$1" --standard
 }
 
 # ---------------------------------------------------------------------------
@@ -408,7 +574,17 @@ make_gh_free_bin() {
   done
 }
 
+# Rolls the counters of the case that just ended into the suite-wide ledgers and
+# starts the next case at zero. The two ledgers are separate from end to end:
+# the verifier is itself an engine session (RF-10, CT-07), so folding it into
+# the implementation count would let a reused implementation session hide behind
+# a verification.
+TOTAL_IMPL=0
+TOTAL_VERIFY=0
+
 reset_engine_counters() {
+  TOTAL_IMPL=$((TOTAL_IMPL + $(impl_sessions)))
+  TOTAL_VERIFY=$((TOTAL_VERIFY + $(verify_sessions)))
   rm -rf "$TMP/mockstate"
   mkdir -p "$TMP/mockstate"
 }
@@ -514,6 +690,21 @@ write_graph_issues() {
   } > "$wgi_target"
 }
 
+# The same document from a newline-separated list of specs, which is the shape
+# `build_fixture` accumulates its repeated `--graph` options into.
+write_graph_issues_from_list() {
+  wgl_target="$1"
+  wgl_specs="$2"
+  (
+    IFS='
+'
+    set -f
+    # shellcheck disable=SC2086  # split on newlines only, with globbing off
+    set -- $wgl_specs
+    write_graph_issues "$wgl_target" "$@"
+  )
+}
+
 # A one-slice CT-01 document with a chosen number of acceptance criteria: the
 # smallest fixture that can exercise a gate end to end, and the one the CT-07
 # count rule needs when it has to emit one line fewer than there are
@@ -545,9 +736,7 @@ write_single_issue() {
 }
 
 single_fixture() {
-  new_fixture "$1"
-  git_init_fixture
-  write_single_issue "$FIX/.spec/features/demo/ISSUES.md" "${2:-1}"
+  build_fixture "$1" --single "${2:-1}"
 }
 
 head_rev() { (cd "$FIX" && git rev-parse HEAD); }
@@ -555,9 +744,12 @@ head_rev() { (cd "$FIX" && git rev-parse HEAD); }
 graph_fixture() {
   gf_name="$1"
   shift
-  new_fixture "$gf_name"
-  git_init_fixture
-  write_graph_issues "$FIX/.spec/features/demo/ISSUES.md" "$@"
+  gf_specs=""
+  for gf_spec in "$@"; do
+    gf_specs="$gf_specs$gf_spec
+"
+  done
+  build_fixture "$gf_name" --graph-list "$gf_specs"
 }
 
 # ---------------------------------------------------------------------------
@@ -605,6 +797,61 @@ case_loop_has_no_associative_array() {
   assert_empty_file "$OUT" "loop.sh declares no associative array (bash 3.2)"
 }
 
+# Every fixture lives under the suite's own temp directory, which the EXIT trap
+# removes, and a run of the loop over a fixture leaves the harness repository
+# this suite is invoked from exactly as it found it.
+case_harness_run_leaks_nothing_outside_the_temp_dir() {
+  standard_fixture leak-scope
+  reset_engine_counters
+
+  case "$FIX" in
+    "$TMP"/*) ok "the fixture lives under the suite temp dir" ;;
+    *) bad "the fixture lives under the suite temp dir (got $FIX)" ;;
+  esac
+  case "$OUT" in
+    "$TMP"/*) ok "the captured log lives under the suite temp dir" ;;
+    *) bad "the captured log lives under the suite temp dir (got $OUT)" ;;
+  esac
+
+  lk_status=$(git -C "$ROOT" status --porcelain)
+  lk_head=$(git -C "$ROOT" rev-parse HEAD)
+  run_loop
+  assert_eq "0" "$RC" "the run over the fixture exits 0"
+  assert_eq "$lk_status" "$(git -C "$ROOT" status --porcelain)" "the run leaves the harness repository untouched"
+  assert_eq "$lk_head" "$(git -C "$ROOT" rev-parse HEAD)" "the run creates no commit in the harness repository"
+  assert_eq "$(cd "$FIX" && pwd -P)" "$(cd "$FIX" && git rev-parse --show-toplevel)" \
+    "the fixture commits land in the fixture repository, never in the harness one"
+}
+
+# T13 AC: the suite has to be able to go RED, or a green run proves nothing. A
+# patched copy of the loop is built with the RF-32 ambiguity guard disabled —
+# a tie stops aborting and stops naming the candidates — and this very suite is
+# re-entered on the input-tie case with MS_LOOP_BIN pointing at that copy. The
+# same case runs against the real loop first, so a red coming from anything
+# other than the patch would be visible here.
+case_harness_patched_loop_proves_the_suite_can_go_red() {
+  new_fixture patched-red
+  pr_dir="$TMP/patched-loop"
+  rm -rf "$pr_dir"
+  mkdir -p "$pr_dir"
+  sed 's/"$rif_count" -gt 1 ]/"$rif_count" -gt 99 ]/g' "$ROOT/scripts/loop.sh" > "$pr_dir/loop.sh"
+  chmod +x "$pr_dir/loop.sh"
+  cp "$ROOT/scripts/test-commands.conf" "$pr_dir/test-commands.conf"
+
+  pr_hits=$(grep -c '"\$rif_count" -gt 99 ]' "$pr_dir/loop.sh")
+  assert_eq "2" "$pr_hits" "the patch disabled both tie guards of the resolution ladder"
+
+  bash "$SELF" case_input_tie_aborts_listing_candidates > "$TMP/nested-green.log" 2>&1
+  assert_eq "0" "$?" "the input-tie case is green against the real loop"
+
+  MS_LOOP_BIN="$pr_dir/loop.sh" bash "$SELF" case_input_tie_aborts_listing_candidates \
+    > "$TMP/nested-red.log" 2>&1
+  assert_ne "0" "$?" "MS_LOOP_BIN pointing at a patched loop turns the case red"
+  assert_contains "$TMP/nested-red.log" "FAIL" "the red run names the assertion that failed"
+  assert_contains "$TMP/nested-red.log" "the tie is named as ambiguous input" \
+    "the ambiguity assertion is the one that went red"
+}
+
 # ---------------------------------------------------------------------------
 # Cases — input resolution (RF-32, CT-05)
 # ---------------------------------------------------------------------------
@@ -634,9 +881,7 @@ case_input_single_feature_glob() {
 }
 
 case_input_init_artifact() {
-  new_fixture init-artifact
-  git_init_fixture
-  write_standard_issues "$FIX/.spec/init/project-issues.md"
+  build_fixture init-artifact --standard --init
   reset_engine_counters
 
   run_loop
@@ -747,28 +992,7 @@ DOC
 case_format_malformed_slice_heading() {
   new_fixture fmt-malformed
   git_init_fixture
-  mkdir -p "$FIX/.spec/features/demo"
-  cat > "$FIX/.spec/features/demo/ISSUES.md" <<'DOC'
-# Issues: broken
-
-## Slice 1: [feat] Fine
-
-- **Blocked by**: nenhum
-
-### Corpo
-
-Body.
-
----
-
-## Slice two: [feat] Broken
-
-- **Blocked by**: nenhum
-
-### Corpo
-
-Body.
-DOC
+  write_malformed_issues "$FIX/.spec/features/demo/ISSUES.md"
   reset_engine_counters
 
   run_loop
@@ -863,29 +1087,14 @@ DOC
 case_format_init_artifact_same_validation() {
   new_fixture fmt-init-same
   git_init_fixture
-  mkdir -p "$FIX/.spec/init"
-  cat > "$FIX/.spec/init/project-issues.md" <<'DOC'
-# Issues: init chain
-
-## Slice 1: [feat] Fine
-
-- **Blocked by**: nenhum
-
-### Corpo
-
-Body.
-
----
-
-## Slice two: [feat] Broken
-
-- **Blocked by**: nenhum
-
-### Corpo
-
-Body.
-DOC
+  write_malformed_issues "$FIX/.spec/init/project-issues.md"
   reset_engine_counters
+
+  # Byte-identical to the document the ISSUES.md case is rejected on: the two
+  # cases share one fixture, so nothing about the init artifact can be adapted.
+  write_malformed_issues "$TMP/malformed-reference.md"
+  assert_same_file "$FIX/.spec/init/project-issues.md" "$TMP/malformed-reference.md" \
+    "the init artifact is the very same fixture the ISSUES.md case uses"
 
   run_loop
   assert_ne "0" "$RC" "init artifact, malformed heading: non-zero exit"
@@ -1176,9 +1385,7 @@ case_testcmd_flag_beats_environment() {
 }
 
 case_testcmd_environment_beats_declarative_config() {
-  standard_fixture testcmd-env-conf
-  printf 'test_cmd=make from-config\n' > "$FIX/.ms-harness.conf"
-  commit_fixture
+  build_fixture testcmd-env-conf --standard --conf "make from-config"
   reset_engine_counters
 
   run_loop
@@ -1191,15 +1398,13 @@ case_testcmd_environment_beats_declarative_config() {
 }
 
 case_testcmd_config_beats_fallback_table() {
-  standard_fixture testcmd-conf-table
-  printf 'module example.test\n' > "$FIX/go.mod"
-  commit_fixture
+  build_fixture testcmd-conf-table --standard --manifest "go.mod=module example.test"
   reset_engine_counters
 
   run_loop
   assert_contains "$OUT" "resolved by the fallback table" "with no config, the table resolves"
 
-  printf '# the consumer declares its own command\ntest_cmd=make from-config\n' > "$FIX/.ms-harness.conf"
+  write_ms_conf "make from-config"
   commit_fixture
   run_loop
   assert_eq "0" "$RC" "declarative config over fallback table: exit 0"
@@ -1214,7 +1419,7 @@ case_testcmd_table_beats_disabled_gate() {
   run_loop
   assert_contains "$OUT" "Suite gate DISABLED: no test command resolved" "with nothing to go on, the gate is disabled"
 
-  printf 'module example.test\n' > "$FIX/go.mod"
+  write_manifest go.mod "module example.test"
   commit_fixture
   run_loop
   assert_eq "0" "$RC" "fallback table over the disabled gate: exit 0"
@@ -1227,9 +1432,8 @@ case_testcmd_table_beats_disabled_gate() {
 case_testcmd_one_fixture_per_supported_manifest() {
   while IFS='|' read -r mf_file mf_content mf_expected; do
     [ -n "$mf_file" ] || continue
-    standard_fixture "manifest-$(printf '%s' "$mf_file" | tr '.' '-')"
-    printf '%s\n' "$mf_content" > "$FIX/$mf_file"
-    commit_fixture
+    build_fixture "manifest-$(printf '%s' "$mf_file" | tr '.' '-')" \
+      --standard --manifest "$mf_file=$mf_content"
     reset_engine_counters
 
     run_loop
@@ -1260,10 +1464,9 @@ case_testcmd_no_manifest_at_all_warns_and_runs() {
 }
 
 case_testcmd_two_manifests_disable_the_gate() {
-  standard_fixture testcmd-two-manifests
-  printf 'module example.test\n' > "$FIX/go.mod"
-  printf '[package]\nname = "example"\n' > "$FIX/Cargo.toml"
-  commit_fixture
+  build_fixture testcmd-two-manifests --standard \
+    --manifest "go.mod=module example.test" \
+    --manifest 'Cargo.toml=[package]'
   reset_engine_counters
 
   run_loop
@@ -1279,10 +1482,8 @@ case_testcmd_two_manifests_disable_the_gate() {
 # the declarative config, which is what makes the table a fallback and not the
 # primary source.
 case_testcmd_emptied_table_still_resolves_through_config() {
-  standard_fixture testcmd-emptied-table
-  printf 'test_cmd=make from-config\n' > "$FIX/.ms-harness.conf"
-  printf 'module example.test\n' > "$FIX/go.mod"
-  commit_fixture
+  build_fixture testcmd-emptied-table --standard \
+    --conf "make from-config" --manifest "go.mod=module example.test"
 
   mkdir -p "$TMP/alt-scripts"
   cp "$LOOP" "$TMP/alt-scripts/loop.sh"
@@ -1312,13 +1513,13 @@ case_testcmd_opening_line_names_the_applied_rule() {
   MS_LOOP_TEST_CMD="make from-env" run_loop
   assert_matches "$OUT" "Suite gate: 'make from-env' — resolved by the MS_LOOP_TEST_CMD environment variable$" "scenario 2 names the environment variable and nothing else"
 
-  printf 'test_cmd=make from-config\n' > "$FIX/.ms-harness.conf"
+  write_ms_conf "make from-config"
   commit_fixture
   run_loop
   assert_matches "$OUT" "Suite gate: 'make from-config' — resolved by the test_cmd key of \.ms-harness\.conf$" "scenario 3 names the declarative config and nothing else"
 
   rm -f "$FIX/.ms-harness.conf"
-  printf 'module example.test\n' > "$FIX/go.mod"
+  write_manifest go.mod "module example.test"
   commit_fixture
   run_loop
   assert_matches "$OUT" "Suite gate: 'go test \./\.\.\.' — resolved by the fallback table .*test-commands\.conf, rule 'exists go\.mod'$" "scenario 4 names the table and the exact rule that matched"
@@ -1876,6 +2077,8 @@ CASES="
 case_harness_mocks_shadow_real_engines
 case_shell_audit_rejects_bash4_construct
 case_loop_has_no_associative_array
+case_harness_run_leaks_nothing_outside_the_temp_dir
+case_harness_patched_loop_proves_the_suite_can_go_red
 case_input_positional_wins
 case_input_single_feature_glob
 case_input_init_artifact
@@ -1955,8 +2158,10 @@ for case_name in $CASES; do
   "$case_name"
 done
 
+reset_engine_counters
+
 echo
-echo "sessions counted separately — implementation: $(impl_sessions), verifier: $(verify_sessions)"
+echo "engine sessions, counted separately — implementation: $TOTAL_IMPL, verifier: $TOTAL_VERIFY"
 echo "passed: $PASS   failed: $FAIL"
 
 if [ "$FAIL" -gt 0 ]; then
