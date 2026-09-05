@@ -1591,11 +1591,20 @@ case_testcmd_probe_inspects_the_invocation_directory_only() {
 # language or a package manager may be named is the data rows of the table.
 case_testcmd_loop_names_no_stack() {
   new_fixture testcmd-no-stack
-  grep -nE 'laravel|artisan|vendor/bin|docker compose exec' "$LOOP" > "$OUT" 2>&1
+
+  # The forbidden names are assembled at run time rather than written out
+  # literally, exactly as the portability audit case above assembles its own
+  # forbidden construct: this file is on the versioned surface that
+  # scripts/check-conformance.sh scans for these very strings (AC-03, AC-04),
+  # and a test that carries the coupling it forbids is drift like any other.
+  stack_names=$(printf '%s|%s|%s|%s' 'lara''vel' 'arti''san' 'vendor''/bin' 'docker compose'' exec')
+  removed_wrapper='sa''il'
+
+  grep -nE "$stack_names" "$LOOP" > "$OUT" 2>&1
   assert_empty_file "$OUT" "loop.sh names no framework, container command or vendored binary path"
 
-  grep -niE '(^|[^[:alnum:]_-])sail([^[:alnum:]_-]|$)' "$LOOP" > "$OUT" 2>&1
-  assert_empty_file "$OUT" "loop.sh contains no occurrence of 'sail' in any case (RF-13)"
+  grep -niE "(^|[^[:alnum:]_-])$removed_wrapper([^[:alnum:]_-]|\$)" "$LOOP" > "$OUT" 2>&1
+  assert_empty_file "$OUT" "loop.sh contains no occurrence of the removed container wrapper, in any case (RF-13)"
 
   # The teeth of "no `elif` naming a language or a framework outside the data
   # rows": every manifest and package-manager name the harness knows lives in
@@ -2193,6 +2202,142 @@ case_loop_never_reads_a_credential_file() {
 }
 
 # ---------------------------------------------------------------------------
+# Repository sanity scripts — check-drift.sh and check-conformance.sh
+#
+# Both take the repository root as an optional argument, which is how the cases
+# below prove they can go red: the versioned tree is copied into the fixture,
+# one anchor is reworded or one violation is planted, and the script runs
+# against the copy. The harness repository itself is never modified.
+# ---------------------------------------------------------------------------
+
+CHECK_DRIFT="$ROOT/scripts/check-drift.sh"
+CHECK_CONFORMANCE="$ROOT/scripts/check-conformance.sh"
+
+# copy_versioned_tree <dest> — the tracked files of the harness repository, and
+# nothing else. The copy carries no .git, so check-conformance.sh exercises its
+# non-git fallback and sees the planted file the way CI would see a new one.
+copy_versioned_tree() {
+  cvt_dest=$1
+  mkdir -p "$cvt_dest"
+  ( cd "$ROOT" && git ls-files ) | while IFS= read -r cvt_f; do
+    [ -n "$cvt_f" ] || continue
+    mkdir -p "$cvt_dest/$(dirname "$cvt_f")"
+    cp "$ROOT/$cvt_f" "$cvt_dest/$cvt_f"
+  done
+}
+
+case_drift_pristine_tree_is_in_sync() {
+  new_fixture drift-pristine
+  "$CHECK_DRIFT" "$ROOT" > "$OUT" 2>&1
+  RC=$?
+  assert_eq "0" "$RC" "check-drift.sh exits 0 on the intact tree"
+  assert_contains "$OUT" "every duplicated rule and contract literal is in sync" "and says so"
+}
+
+# The four anchor groups exist and cover the files the contract names.
+case_drift_anchor_groups_cover_the_listed_files() {
+  new_fixture drift-groups
+  assert_contains "$CHECK_DRIFT" "(a) shared init rules" "group (a) — shared init rules"
+  assert_contains "$CHECK_DRIFT" "(b) CT-07 verifier protocol" "group (b) — CT-07 protocol"
+  assert_contains "$CHECK_DRIFT" "(c) CT-01 field literals" "group (c) — CT-01 fields"
+  assert_contains "$CHECK_DRIFT" "(d) CT-02 heading literals" "group (d) — CT-02 headings"
+
+  # Group (a) binds the four chain commands plus the router.
+  for f in commands/init/project-description.md commands/init/user-stories.md \
+    commands/init/database-schema.md commands/init/project-issues.md commands/init.md; do
+    assert_contains "$CHECK_DRIFT" "$f" "group (a) names $f"
+  done
+
+  # Groups (b), (c) and (d) bind the verifier, the issuer and the loop.
+  assert_contains "$CHECK_DRIFT" "agents/issue-verifier.md" "the verifier agent is anchored"
+  assert_contains "$CHECK_DRIFT" "agents/issuer.md" "the issuer agent is anchored"
+  assert_contains "$CHECK_DRIFT" "scripts/loop.sh" "the loop is anchored"
+
+  # The CT-01 field literals and the CT-02 headings are anchors, not prose.
+  assert_contains "$CHECK_DRIFT" 'check '"'"'- **Blocked by**:'"'"'' "the blocking field is an anchor"
+  assert_contains "$CHECK_DRIFT" 'check '"'"'- **Demoável por**:'"'"'' "the demo field is an anchor"
+  assert_contains "$CHECK_DRIFT" 'check '"'"'- **Issue**:'"'"'' "the published-number field is an anchor"
+  assert_contains "$CHECK_DRIFT" 'check '"'"'## Critérios de aceite'"'"'' "the acceptance-criteria heading is an anchor"
+}
+
+# Rewording one copy of an anchor makes the check go red, naming both the file
+# that drifted and the anchor it lost.
+case_drift_reworded_anchor_goes_red() {
+  new_fixture drift-reworded
+  copy_versioned_tree "$FIX/tree"
+
+  sed 's/- When in doubt, INCOMPLETE\./- When unsure, INCOMPLETE./' \
+    "$FIX/tree/agents/issue-verifier.md" > "$FIX/reworded.md"
+  mv "$FIX/reworded.md" "$FIX/tree/agents/issue-verifier.md"
+
+  "$CHECK_DRIFT" "$FIX/tree" > "$OUT" 2>&1
+  RC=$?
+  assert_ne "0" "$RC" "a reworded anchor copy exits non-zero"
+  assert_contains "$OUT" "DRIFT: missing in agents/issue-verifier.md" "the drifted file is named"
+  assert_contains "$OUT" "- When in doubt, INCOMPLETE." "the missing anchor is quoted"
+}
+
+case_conformance_finished_tree_passes() {
+  new_fixture conformance-clean
+  "$CHECK_CONFORMANCE" "$ROOT" > "$OUT" 2>&1
+  RC=$?
+  assert_eq "0" "$RC" "check-conformance.sh exits 0 on the finished tree"
+  for ac in AC-01 AC-02 AC-03 AC-04 AC-05 AC-06 AC-07; do
+    assert_contains "$OUT" "== $ac" "$ac has its own labelled block"
+  done
+  assert_contains "$OUT" "does not match AGENTS.md" "the namespace check proves it ignores foreign names"
+}
+
+# The planted violation of the acceptance criterion: a file under scripts/
+# carrying the name of the container wrapper the harness removed. Assembled at
+# run time, so this suite does not carry the literal it plants.
+case_conformance_planted_violation_goes_red() {
+  new_fixture conformance-planted
+  copy_versioned_tree "$FIX/tree"
+
+  planted='sa''il'
+  {
+    echo '#!/usr/bin/env bash'
+    echo "# a stack-coupled helper: $planted test"
+  } > "$FIX/tree/scripts/offender.sh"
+
+  "$CHECK_CONFORMANCE" "$FIX/tree" > "$OUT" 2>&1
+  RC=$?
+  assert_ne "0" "$RC" "a planted stack coupling under scripts/ exits non-zero"
+  assert_contains "$OUT" "== AC-03" "the failure is reported under AC-03"
+  assert_contains "$OUT" "scripts/offender.sh" "the offending file is named"
+
+  # Removing the plant makes the same copy green again, so the red above is the
+  # plant and not the copy.
+  rm -f "$FIX/tree/scripts/offender.sh"
+  "$CHECK_CONFORMANCE" "$FIX/tree" > "$OUT" 2>&1
+  RC=$?
+  assert_eq "0" "$RC" "the same copy without the plant exits 0"
+}
+
+# The exclusion set is a literal in the header, it is closed, and AC-06 stops
+# at commands/ and agents/ — scripts/ is where the loop's git writes live.
+case_conformance_exclusion_set_and_ac06_scope() {
+  new_fixture conformance-scope
+  for entry in '.git/' '.spec/' 'scripts/check-conformance.sh' 'README.md' 'CHANGELOG.md'; do
+    assert_contains "$CHECK_CONFORMANCE" "#   $entry" "the header names the exclusion '$entry'"
+  done
+  assert_contains "$CHECK_CONFORMANCE" "Nothing else is excluded." "the exclusion set is declared closed"
+
+  # The runtime filter applies exactly those five and nothing more.
+  grep -n 'continue ;;' "$CHECK_CONFORMANCE" | grep -F '.git/*' > "$OUT" 2>&1
+  assert_contains "$OUT" '.git/* | .spec/* | "$SELF" | README.md | CHANGELOG.md' \
+    "the filter excludes exactly the named set"
+
+  assert_contains "$CHECK_CONFORMANCE" 'commands/* | agents/*' "AC-06 is scoped to commands/ and agents/"
+  assert_contains "$CHECK_CONFORMANCE" "AC-06 does not cover scripts/" "AC-06 states that scripts/ is out of its scope"
+
+  # And the loop really does perform the git write AC-06 refuses to forbid.
+  grep -c 'git commit' "$LOOP" > "$OUT" 2>&1
+  assert_ne "0" "$(cat "$OUT")" "the loop commits, which is why AC-06 stops before scripts/"
+}
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -2269,6 +2414,12 @@ case_sessions_are_never_reused
 case_exit_code_matrix
 case_final_report_groups_by_state
 case_loop_never_reads_a_credential_file
+case_drift_pristine_tree_is_in_sync
+case_drift_anchor_groups_cover_the_listed_files
+case_drift_reworded_anchor_goes_red
+case_conformance_finished_tree_passes
+case_conformance_planted_violation_goes_red
+case_conformance_exclusion_set_and_ac06_scope
 "
 
 make_mocks

@@ -90,6 +90,13 @@
 #   candidate found: the loop never asks and never picks one by itself. No
 #   candidate at all aborts naming every location that was searched.
 #
+# Slice metadata fields of the input document, written before the `### Corpo`
+# marker in this order: `- **Issue**:`, `- **Tasks**:`, `- **Cobre**:`,
+# `- **Blocked by**:`, `- **Demoável por**:`. The loop parses two of them —
+# `- **Blocked by**:` for the dependency graph and `- **Issue**:` for the
+# published number, which is excluded from the hashed body. The rest travel
+# with the slice into the engine prompt untouched.
+#
 # Input format contract, validated in preflight before any engine session:
 #   - at least one `## Slice <N>: <title>` heading
 #   - no malformed `## Slice ...` heading and no repeated slice number
