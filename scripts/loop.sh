@@ -64,6 +64,34 @@
 #   The `## Bloqueado por` heading of an issue body is prose for the developer
 #   and is never parsed; a divergence between the two is not a format error.
 #
+# Dependency graph and selection. Readiness is decided from the input document
+# and the progress record alone: while an unfinished slice remains, the loop
+# takes the next one, in topological order, whose blockers are every one of
+# them recorded `done`. GitHub is never consulted to decide readiness, so the
+# loop behaves identically with `gh` absent from PATH. A `#<n>` blocker that
+# matches no slice of this same document is an EXTERNAL block: that slice is
+# never selected, is recorded and reported `blocked-external`, and never makes
+# the run fail. Every slice downstream of a slice that can no longer complete —
+# one that ended `failed`, one blocked externally — is marked `blocked`
+# TRANSITIVELY, with zero engine sessions for any of them.
+#
+# Suite gate command, resolved by a fixed precedence, first rule that resolves:
+#   1. the --test-cmd flag
+#   2. the MS_LOOP_TEST_CMD environment variable
+#   3. the `test_cmd=` key of .ms-harness.conf in the invocation directory
+#   4. the fallback table scripts/test-commands.conf, probing ONLY the
+#      invocation directory — no recursive scan, no walk up to a parent
+#   5. nothing resolved -> loud warning and the suite gate is DISABLED
+#
+#   The loop NEVER aborts over an unresolved test command: it degrades onto the
+#   verifier gate and says so. More than one fallback-table rule matching is
+#   the same degradation — it warns, lists every matched candidate and disables
+#   the gate, because picking one would let the table's order impose a
+#   precedence between stacks that the table exists to not have.
+#
+#   Levels 3 and 4 are data files, never code. No language, framework, runtime
+#   or package manager is named as a branch anywhere in this script.
+#
 # Slice capture. A slice opens at its `## Slice <N>: ` heading and carries its
 # metadata fields, its `### Corpo` marker and the whole issue body. Capture
 # closes at the next `## Slice <N>: ` heading, at end of file, or at a level-2
@@ -128,6 +156,13 @@ MS_LOOP_LABEL="${MS_LOOP_LABEL:-ready-for-agent}"
 export MS_LOOP_LABEL
 
 TAB=$(printf '\t')
+
+# The fallback table ships with the harness, so it is resolved from the script,
+# never from the invocation directory. The declarative config belongs to the
+# consumer project and is therefore read from the invocation directory.
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
+FALLBACK_TABLE="$SCRIPT_DIR/test-commands.conf"
+CONSUMER_CONF=".ms-harness.conf"
 
 usage() {
   awk 'NR > 1 && /^#/ { sub(/^#[[:space:]]?/, ""); print; next } NR > 1 { exit }' "$0"
@@ -540,58 +575,6 @@ flush_slice() {
   si_current=""
 }
 
-# Kahn's algorithm over the `- **Blocked by**:` graph. A cycle stalls every
-# slice in it, so the ones still standing when no progress is possible ARE the
-# cycle; their `- **Blocked by**:` lines are the offending lines.
-validate_acyclic() {
-  va_remaining=""
-  # shellcheck disable=SC2034  # positional fields of the record; a reader
-  # only uses the ones it needs, but every field has to be named to be skipped.
-  while IFS='|' read -r va_num va_head va_issue va_bline va_braw va_title; do
-    [ -n "$va_num" ] || continue
-    va_remaining="$va_remaining $va_num"
-  done <<EOF
-$SLICE_INDEX
-EOF
-  va_remaining=$(trim "$va_remaining")
-
-  while [ -n "$va_remaining" ]; do
-    va_progress=false
-    va_next=""
-    for va_num in $va_remaining; do
-      va_braw=$(slice_field "$va_num" 5)
-      va_blockers=$(blockers_as_slice_numbers "$va_braw")
-      va_ready=true
-      for va_dep in $va_blockers; do
-        # A slice listed as its own blocker is still in $va_remaining, so the
-        # membership test below already reports it as a cycle.
-        if in_list "$va_dep" "$va_remaining"; then
-          va_ready=false
-          break
-        fi
-      done
-      if [ "$va_ready" = true ]; then
-        va_progress=true
-      else
-        va_next="$va_next $va_num"
-      fi
-    done
-
-    va_next=$(trim "$va_next")
-    if [ "$va_progress" = false ]; then
-      va_lines=""
-      for va_num in $va_next; do
-        va_bline=$(slice_field "$va_num" 4)
-        va_braw=$(slice_field "$va_num" 5)
-        va_lines="$va_lines$va_bline: Slice $va_num — - **Blocked by**: $va_braw
-"
-      done
-      abort_format "the '- **Blocked by**:' graph has a cycle; these slices block each other:" "$va_lines"
-    fi
-    va_remaining="$va_next"
-  done
-}
-
 # Field <n> (1-based) of the SLICE_INDEX record of slice <number>.
 slice_field() {
   sf_num="$1"
@@ -817,23 +800,38 @@ EOF
 PROGRESS_STATES='done unverified failed blocked blocked-external'
 PROGRESS_GATES='passed failed disabled'
 
-progress_state() {
-  ps_num="$1"
-  ps_hash="$2"
+# Field <index> (1-based) of the record of slice <number>, looked up on the
+# COMPOSITE key: an entry whose recorded hash no longer matches simply does not
+# answer, which is per-slice invalidation and never a global reset.
+progress_field() {
+  pf_num="$1"
+  pf_hash="$2"
+  pf_index="$3"
   [ -f "$PROGRESS_FILE" ] || return 0
-  while IFS= read -r ps_line || [ -n "$ps_line" ]; do
-    [ -n "$ps_line" ] || continue
-    ps_rest="$ps_line"
-    ps_f1="${ps_rest%%"$TAB"*}"; ps_rest="${ps_rest#*"$TAB"}"
-    ps_f2="${ps_rest%%"$TAB"*}"; ps_rest="${ps_rest#*"$TAB"}"
-    ps_f3="${ps_rest%%"$TAB"*}"
-    if [ "$ps_f1" = "$ps_num" ] && [ "$ps_f2" = "$ps_hash" ]; then
-      printf '%s' "$ps_f3"
-      return 0
-    fi
+  while IFS= read -r pf_line || [ -n "$pf_line" ]; do
+    [ -n "$pf_line" ] || continue
+    pf_rest="$pf_line"
+    pf_f1="${pf_rest%%"$TAB"*}"; pf_rest="${pf_rest#*"$TAB"}"
+    pf_f2="${pf_rest%%"$TAB"*}"; pf_rest="${pf_rest#*"$TAB"}"
+    pf_f3="${pf_rest%%"$TAB"*}"; pf_rest="${pf_rest#*"$TAB"}"
+    pf_f4="${pf_rest%%"$TAB"*}"; pf_rest="${pf_rest#*"$TAB"}"
+    pf_f5="${pf_rest%%"$TAB"*}"; pf_f6="${pf_rest#*"$TAB"}"
+    [ "$pf_f1" = "$pf_num" ] && [ "$pf_f2" = "$pf_hash" ] || continue
+    case "$pf_index" in
+      1) printf '%s' "$pf_f1" ;;
+      2) printf '%s' "$pf_f2" ;;
+      3) printf '%s' "$pf_f3" ;;
+      4) printf '%s' "$pf_f4" ;;
+      5) printf '%s' "$pf_f5" ;;
+      6) printf '%s' "$pf_f6" ;;
+    esac
+    return 0
   done < "$PROGRESS_FILE"
   return 0
 }
+
+progress_state() { progress_field "$1" "$2" 3; }
+progress_cause() { progress_field "$1" "$2" 6; }
 
 progress_is_done() {
   [ "$(progress_state "$1" "$2")" = "done" ]
@@ -881,6 +879,401 @@ progress_put() {
 }
 
 # ---------------------------------------------------------------------------
+# Suite gate command resolution (RF-16 to RF-20, UI-04)
+#
+# Five levels, first rule that resolves. Levels 3 and 4 are DATA: a `key=value`
+# file owned by the consumer project and a table of `<probe> :: <command>` rows
+# shipped with the harness. Both are walked by a plain read loop, so the set of
+# languages, frameworks and package managers the harness knows about is exactly
+# the set written in those two files — never a branch in this script (RF-18).
+# ---------------------------------------------------------------------------
+
+TEST_CMD=""
+TEST_CMD_RULE=""
+SUITE_GATE="disabled"
+
+# Value of <key> in a `key=value` file, empty when the file or the key is
+# absent. Blank lines and `#` comments are skipped, unknown keys are ignored,
+# the value is everything after the first `=` with the surrounding blanks
+# trimmed, and it is never expanded. Deliberately readable with the shell
+# alone: `jq` is an optional dependency and may not be required here.
+conf_value() {
+  cv_key="$1"
+  cv_file="$2"
+  [ -f "$cv_file" ] || return 0
+  while IFS= read -r cv_line || [ -n "$cv_line" ]; do
+    cv_line=$(trim "$cv_line")
+    case "$cv_line" in
+      '' | '#'*) continue ;;
+      *=*) ;;
+      *) continue ;;
+    esac
+    [ "$(trim "${cv_line%%=*}")" = "$cv_key" ] || continue
+    cv_value=$(trim "${cv_line#*=}")
+    if [ -n "$cv_value" ]; then
+      printf '%s' "$cv_value"
+      return 0
+    fi
+  done < "$cv_file"
+  return 0
+}
+
+# One clause of a fallback-table probe: `exists <path>` or
+# `contains <path> <extended-regexp>`. The path is matched against the
+# INVOCATION DIRECTORY only — a path carrying a `/` is a malformed rule and
+# never matches, which is what keeps a probe from descending into a
+# subdirectory or climbing to a parent (RF-17).
+probe_clause_matches() {
+  pcm_clause="$1"
+  case "$pcm_clause" in
+    'exists '*)
+      pcm_path=$(trim "${pcm_clause#exists }")
+      [ -n "$pcm_path" ] || return 1
+      case "$pcm_path" in */*) return 1 ;; esac
+      [ -f "$pcm_path" ]
+      ;;
+    'contains '*)
+      pcm_rest=$(trim "${pcm_clause#contains }")
+      pcm_path="${pcm_rest%% *}"
+      pcm_re="${pcm_rest#* }"
+      [ -n "$pcm_path" ] && [ "$pcm_path" != "$pcm_rest" ] || return 1
+      case "$pcm_path" in */*) return 1 ;; esac
+      [ -f "$pcm_path" ] || return 1
+      grep -qE "$pcm_re" "$pcm_path"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# A probe is an alternation: its clauses are separated by ` || ` and any one of
+# them matching matches the rule. One ecosystem with two possible manifests
+# therefore stays ONE rule, and so one candidate.
+probe_matches() {
+  pm_rest="$1"
+  while [ -n "$pm_rest" ]; do
+    case "$pm_rest" in
+      *' || '*)
+        pm_clause="${pm_rest%%' || '*}"
+        pm_rest="${pm_rest#*' || '}"
+        ;;
+      *)
+        pm_clause="$pm_rest"
+        pm_rest=""
+        ;;
+    esac
+    if probe_clause_matches "$(trim "$pm_clause")"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# EVERY fallback-table rule whose probe matches, one `<probe> :: <command>` per
+# line — never the first match. The caller needs all of them: more than one
+# match disables the gate (RF-19) instead of letting this file's order pick a
+# winner, and the order of this file is documented as carrying no meaning.
+TABLE_MATCHES=""
+TABLE_MATCH_COUNT=0
+
+scan_fallback_table() {
+  TABLE_MATCHES=""
+  TABLE_MATCH_COUNT=0
+  [ -f "$FALLBACK_TABLE" ] || return 0
+
+  while IFS= read -r sft_line || [ -n "$sft_line" ]; do
+    case "$(trim "$sft_line")" in
+      '' | '#'*) continue ;;
+    esac
+    case "$sft_line" in
+      *' :: '*) ;;
+      *) continue ;;
+    esac
+    sft_probe=$(trim "${sft_line%% :: *}")
+    sft_cmd=$(trim "${sft_line#* :: }")
+    [ -n "$sft_probe" ] && [ -n "$sft_cmd" ] || continue
+    if probe_matches "$sft_probe"; then
+      TABLE_MATCHES="$TABLE_MATCHES$sft_probe :: $sft_cmd
+"
+      TABLE_MATCH_COUNT=$((TABLE_MATCH_COUNT + 1))
+    fi
+  done < "$FALLBACK_TABLE"
+}
+
+resolve_test_command() {
+  TEST_CMD=""
+  TEST_CMD_RULE=""
+  SUITE_GATE="disabled"
+  TABLE_MATCHES=""
+  TABLE_MATCH_COUNT=0
+
+  if [ -n "$TEST_CMD_FLAG" ]; then
+    TEST_CMD="$TEST_CMD_FLAG"
+    TEST_CMD_RULE="the --test-cmd flag"
+  elif [ -n "${MS_LOOP_TEST_CMD:-}" ]; then
+    TEST_CMD="$MS_LOOP_TEST_CMD"
+    TEST_CMD_RULE="the MS_LOOP_TEST_CMD environment variable"
+  else
+    rtc_declared=$(conf_value 'test_cmd' "$CONSUMER_CONF")
+    if [ -n "$rtc_declared" ]; then
+      TEST_CMD="$rtc_declared"
+      TEST_CMD_RULE="the test_cmd key of $CONSUMER_CONF"
+    else
+      scan_fallback_table
+      if [ "$TABLE_MATCH_COUNT" -eq 1 ]; then
+        rtc_rule=$(printf '%s' "$TABLE_MATCHES" | sed '/^$/d')
+        TEST_CMD=$(trim "${rtc_rule#* :: }")
+        TEST_CMD_RULE="the fallback table $FALLBACK_TABLE, rule '${rtc_rule%% :: *}'"
+      fi
+    fi
+  fi
+
+  if [ -n "$TEST_CMD" ]; then
+    SUITE_GATE="enabled"
+    log "Suite gate: '$TEST_CMD' — resolved by $TEST_CMD_RULE"
+    return 0
+  fi
+
+  if [ "$TABLE_MATCH_COUNT" -gt 1 ]; then
+    warn "Suite gate DISABLED: the fallback table matched $TABLE_MATCH_COUNT rules in $(pwd) and the loop never picks one."
+    printf '%s\n' "$TABLE_MATCHES" | sed '/^$/d; s/^/    matched: /' >&2
+    warn "Letting the table's order break this tie would be a precedence between stacks, which is exactly what the table must not have."
+    warn "Declare the command yourself to re-enable the gate: --test-cmd, MS_LOOP_TEST_CMD, or 'test_cmd=' in $CONSUMER_CONF."
+  else
+    warn "Suite gate DISABLED: no test command resolved. Searched, in this order:"
+    warn "    1. the --test-cmd flag                       (not given)"
+    warn "    2. the MS_LOOP_TEST_CMD environment variable (not set)"
+    warn "    3. the test_cmd key of $CONSUMER_CONF        (absent or empty)"
+    warn "    4. $FALLBACK_TABLE (no rule matched $(pwd))"
+    warn "Declare the command to re-enable the gate: --test-cmd, MS_LOOP_TEST_CMD, or 'test_cmd=' in $CONSUMER_CONF."
+  fi
+  warn "The run continues on the verifier gate alone: an unresolved test command never aborts the loop."
+  return 0
+}
+
+# RF-20: with both mechanical gates off, nothing left in the run can tell a
+# finished issue from an unfinished one. Said out loud BEFORE the first engine
+# session, never after the fact.
+warn_when_no_mechanical_validation() {
+  [ "$SUITE_GATE" = "disabled" ] || return 0
+  [ "$VERIFY_MODE" = "off" ] || return 0
+  warn "NO MECHANICAL VALIDATION IS ACTIVE — the suite gate and the verifier gate are both disabled."
+  warn "Nothing in this run can tell a finished issue from an unfinished one."
+  warn "Every issue executed will be recorded 'unverified', never 'done', and the run will exit non-zero."
+}
+
+# ---------------------------------------------------------------------------
+# Dependency graph (RF-11, RF-34 a, b)
+#
+# Built EXCLUSIVELY from the `- **Blocked by**:` field of each slice. The
+# `## Bloqueado por` heading of an issue body is prose and is never read here;
+# a divergence between the two is not an error. Readiness comes from this
+# document plus the progress record and from nothing else — GitHub is never
+# asked, so the graph resolves identically with `gh` absent from PATH.
+# ---------------------------------------------------------------------------
+
+all_slice_numbers() {
+  asn_out=""
+  # shellcheck disable=SC2034  # positional fields of the record; a reader
+  # only uses the ones it needs, but every field has to be named to be skipped.
+  while IFS='|' read -r asn_num asn_head asn_issue asn_bline asn_braw asn_title; do
+    [ -n "$asn_num" ] || continue
+    asn_out="$asn_out $asn_num"
+  done <<EOF
+$SLICE_INDEX
+EOF
+  printf '%s' "$(trim "$asn_out")"
+}
+
+# The blockers of a slice that ARE slices of this same document, as slice
+# numbers: the edges of the graph.
+slice_blockers() {
+  blockers_as_slice_numbers "$(slice_field "$1" 5)"
+}
+
+# The `#<n>` blockers of a slice that match no slice of this same document:
+# external blocks, which are not edges and can never be satisfied here.
+external_blockers_of() {
+  ebo_raw=$(trim "$1")
+  ebo_out=""
+  [ "$ebo_raw" = "nenhum" ] && return 0
+
+  ebo_rest="$ebo_raw"
+  while [ -n "$ebo_rest" ]; do
+    ebo_item="${ebo_rest%%,*}"
+    if [ "$ebo_item" = "$ebo_rest" ]; then
+      ebo_rest=""
+    else
+      ebo_rest="${ebo_rest#*,}"
+    fi
+    ebo_item=$(trim "$ebo_item")
+    case "$ebo_item" in
+      '#'*)
+        if [ -z "$(slice_number_for_issue "${ebo_item#\#}")" ]; then
+          ebo_out="$ebo_out $ebo_item"
+        fi
+        ;;
+    esac
+  done
+  printf '%s' "$(trim "$ebo_out")"
+}
+
+slice_external_blockers() {
+  external_blockers_of "$(slice_field "$1" 5)"
+}
+
+# Kahn over the `- **Blocked by**:` graph, emitting one slice at a time and
+# breaking a tie between equally ready slices on the lower slice number, so the
+# order is deterministic and stays as close to the document as the declared
+# dependencies allow. TOPO_ORDER is the slice numbers in dependency order;
+# TOPO_STALLED holds the slices no traversal can ever reach, which in a finite
+# graph ARE a cycle.
+TOPO_ORDER=""
+TOPO_STALLED=""
+
+compute_topological_order() {
+  TOPO_ORDER=""
+  TOPO_STALLED=""
+  cto_remaining=$(all_slice_numbers)
+
+  while [ -n "$cto_remaining" ]; do
+    cto_pick=""
+    for cto_num in $cto_remaining; do
+      cto_ready=true
+      for cto_dep in $(slice_blockers "$cto_num"); do
+        # A slice listed as its own blocker is still in $cto_remaining, so the
+        # membership test below already reports it as a cycle.
+        if in_list "$cto_dep" "$cto_remaining"; then
+          cto_ready=false
+          break
+        fi
+      done
+      [ "$cto_ready" = true ] || continue
+      if [ -z "$cto_pick" ] || [ "$cto_num" -lt "$cto_pick" ]; then
+        cto_pick="$cto_num"
+      fi
+    done
+
+    if [ -z "$cto_pick" ]; then
+      TOPO_STALLED="$cto_remaining"
+      break
+    fi
+
+    TOPO_ORDER="$TOPO_ORDER $cto_pick"
+    cto_next=""
+    for cto_num in $cto_remaining; do
+      [ "$cto_num" = "$cto_pick" ] || cto_next="$cto_next $cto_num"
+    done
+    cto_remaining=$(trim "$cto_next")
+  done
+
+  TOPO_ORDER=$(trim "$TOPO_ORDER")
+}
+
+validate_acyclic() {
+  compute_topological_order
+  [ -n "$TOPO_STALLED" ] || return 0
+
+  va_lines=""
+  for va_num in $TOPO_STALLED; do
+    va_bline=$(slice_field "$va_num" 4)
+    va_braw=$(slice_field "$va_num" 5)
+    va_lines="$va_lines$va_bline: Slice $va_num — - **Blocked by**: $va_braw
+"
+  done
+  abort_format "the '- **Blocked by**:' graph has a cycle; these slices block each other:" "$va_lines"
+}
+
+# The slices that name <n> among their blockers.
+direct_dependents() {
+  dd_target="$1"
+  dd_out=""
+  for dd_num in $(all_slice_numbers); do
+    for dd_dep in $(slice_blockers "$dd_num"); do
+      if [ "$dd_dep" = "$dd_target" ]; then
+        dd_out="$dd_out $dd_num"
+        break
+      fi
+    done
+  done
+  printf '%s' "$(trim "$dd_out")"
+}
+
+# The whole downstream cone of <n>, at any depth. The graph is a graph and not
+# the mirrored harness's linear phase chain, so propagation has to be
+# transitive: a dependent of a dependent is just as unreachable (RF-34b).
+transitive_dependents() {
+  td_seen=""
+  td_queue="$1"
+  while [ -n "$td_queue" ]; do
+    td_next=""
+    for td_num in $td_queue; do
+      for td_dep in $(direct_dependents "$td_num"); do
+        if ! in_list "$td_dep" "$td_seen"; then
+          td_seen="$td_seen $td_dep"
+          td_next="$td_next $td_dep"
+        fi
+      done
+    done
+    td_queue=$(trim "$td_next")
+  done
+  printf '%s' "$(trim "$td_seen")"
+}
+
+# Record every slice downstream of <n> as `blocked`, and echo the ones marked.
+# Called when a slice can no longer reach `done` — it ended `failed` (RF-34b)
+# or it is blocked externally — because from that moment no traversal will ever
+# record its dependents' blockers `done`. None of them ever reaches an engine.
+# A slice already recorded `blocked-external` keeps that state: its own
+# blocker lives outside this document and that is the more precise report.
+mark_blocked_transitively() {
+  mbt_root="$1"
+  mbt_cause="$2"
+  mbt_marked=""
+  for mbt_num in $(transitive_dependents "$mbt_root"); do
+    mbt_hash=$(manifest_hash_for "$mbt_num")
+    [ "$(progress_state "$mbt_num" "$mbt_hash")" = "blocked-external" ] && continue
+    progress_put "$mbt_num" "$mbt_hash" "blocked" "disabled" "disabled" "$mbt_cause"
+    mbt_marked="$mbt_marked $mbt_num"
+  done
+  printf '%s' "$(trim "$mbt_marked")"
+}
+
+# The next slice to execute: the first one in topological order that still has
+# to run and whose every blocker is RECORDED `done`. That record is the only
+# readiness signal there is — RF-11 forbids asking GitHub, and the loop must
+# work with `gh` off the PATH. A slice with an external block is never
+# selected, at any point of the run.
+#
+# `--only-slice` is an explicit human override and skips the blocker check; it
+# does not override an external block, which can never be satisfied here.
+select_next_ready() {
+  for snr_num in $TOPO_ORDER; do
+    if [ -n "$ONLY_SLICE" ] && [ "$ONLY_SLICE" != "$snr_num" ]; then
+      continue
+    fi
+    snr_hash=$(manifest_hash_for "$snr_num")
+    progress_should_run "$snr_num" "$snr_hash" || continue
+    [ -z "$(slice_external_blockers "$snr_num")" ] || continue
+
+    snr_ready=true
+    if [ -z "$ONLY_SLICE" ]; then
+      for snr_dep in $(slice_blockers "$snr_num"); do
+        snr_dhash=$(manifest_hash_for "$snr_dep")
+        if ! progress_is_done "$snr_dep" "$snr_dhash"; then
+          snr_ready=false
+          break
+        fi
+      done
+    fi
+    [ "$snr_ready" = true ] || continue
+
+    printf '%s' "$snr_num"
+    return 0
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Run plan
 # ---------------------------------------------------------------------------
 
@@ -897,8 +1290,39 @@ validate_only_slice() {
 }
 
 PENDING_SLICES=""
+EXTERNALLY_BLOCKED=""
+BLOCKED_SLICES=""
+
+# The slices the graph rules out before the run starts. An external block is
+# recorded and reported `blocked-external` and never fails the run (RF-11);
+# everything downstream of it is `blocked`, transitively, because a blocker
+# living outside this document can never be recorded `done` here (RF-34b).
+classify_blocked_slices() {
+  EXTERNALLY_BLOCKED=""
+  BLOCKED_SLICES=""
+
+  for cbs_num in $(all_slice_numbers); do
+    cbs_ext=$(slice_external_blockers "$cbs_num")
+    [ -n "$cbs_ext" ] || continue
+    EXTERNALLY_BLOCKED="$EXTERNALLY_BLOCKED $cbs_num"
+    cbs_hash=$(manifest_hash_for "$cbs_num")
+    progress_put "$cbs_num" "$cbs_hash" "blocked-external" "disabled" "disabled" \
+      "waiting on $cbs_ext, which matches no slice of $INPUT_FILE"
+  done
+  EXTERNALLY_BLOCKED=$(trim "$EXTERNALLY_BLOCKED")
+
+  for cbs_num in $EXTERNALLY_BLOCKED; do
+    for cbs_dep in $(mark_blocked_transitively "$cbs_num" \
+      "blocked by Slice $cbs_num, which is blocked externally"); do
+      in_list "$cbs_dep" "$BLOCKED_SLICES" || BLOCKED_SLICES="$BLOCKED_SLICES $cbs_dep"
+    done
+  done
+  BLOCKED_SLICES=$(trim "$BLOCKED_SLICES")
+}
 
 print_run_plan() {
+  classify_blocked_slices
+
   PENDING_SLICES=""
   log "Run plan ($INPUT_FILE):"
   # shellcheck disable=SC2034  # positional fields of the record; a reader
@@ -908,7 +1332,11 @@ print_run_plan() {
     prp_state=$(progress_state "$prp_num" "$prp_hash")
     [ -n "$prp_state" ] || prp_state="pending"
 
-    if [ -n "$ONLY_SLICE" ] && [ "$ONLY_SLICE" != "$prp_num" ]; then
+    if in_list "$prp_num" "$EXTERNALLY_BLOCKED"; then
+      prp_action="skip: blocked externally by $(slice_external_blockers "$prp_num")"
+    elif in_list "$prp_num" "$BLOCKED_SLICES"; then
+      prp_action="skip: $(progress_cause "$prp_num" "$prp_hash")"
+    elif [ -n "$ONLY_SLICE" ] && [ "$ONLY_SLICE" != "$prp_num" ]; then
       prp_action="skip: --only-slice $ONLY_SLICE"
     elif progress_should_run "$prp_num" "$prp_hash"; then
       prp_action="run"
@@ -921,13 +1349,44 @@ print_run_plan() {
   done <<EOF
 $(manifest_entries)
 EOF
-  PENDING_SLICES=$(trim "$PENDING_SLICES")
+
+  # The queue is kept in topological order, so the slices leave the plan in the
+  # order their `- **Blocked by**:` fields declare.
+  prp_ordered=""
+  for prp_num in $TOPO_ORDER; do
+    in_list "$prp_num" "$PENDING_SLICES" && prp_ordered="$prp_ordered $prp_num"
+  done
+  PENDING_SLICES=$(trim "$prp_ordered")
+
+  prp_order_line=""
+  for prp_num in $TOPO_ORDER; do
+    if [ -z "$prp_order_line" ]; then
+      prp_order_line="Slice $prp_num"
+    else
+      prp_order_line="$prp_order_line -> Slice $prp_num"
+    fi
+  done
+  log "Execution order, from '- **Blocked by**:' alone: $prp_order_line"
+
+  if [ -n "$EXTERNALLY_BLOCKED" ]; then
+    warn "Blocked externally — never selected, and never a reason for the run to fail:"
+    for prp_num in $EXTERNALLY_BLOCKED; do
+      warn "    Slice $prp_num — waiting on $(slice_external_blockers "$prp_num"), which matches no slice of $INPUT_FILE"
+    done
+  fi
 
   prp_pending=0
   for prp_num in $PENDING_SLICES; do
     prp_pending=$((prp_pending + 1))
   done
   log "$prp_pending slice(s) to execute, $((SLICE_COUNT - prp_pending)) skipped"
+
+  prp_next=$(select_next_ready)
+  if [ -n "$prp_next" ]; then
+    log "Next ready slice: Slice $prp_next — $(slice_field "$prp_next" 6)"
+  else
+    log "No slice is ready to execute."
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -978,6 +1437,8 @@ main() {
   preflight
   split_slices
   validate_only_slice
+  resolve_test_command
+  warn_when_no_mechanical_validation
   print_run_plan
 
   m_elapsed=$(($(date +%s) - m_started))

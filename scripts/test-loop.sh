@@ -166,6 +166,13 @@ FIX=""
 OUT=""
 RC=0
 
+# The directory the loop is invoked from and the PATH it sees. Both default to
+# the fixture and the mock PATH; a case overrides one to prove that the test
+# command is probed in the INVOCATION directory only, or that the run needs no
+# `gh` on PATH.
+RUN_DIR=""
+RUN_PATH=""
+
 new_fixture() {
   FIX="$TMP/fx-$1"
   OUT="$TMP/out-$1.log"
@@ -173,6 +180,8 @@ new_fixture() {
   mkdir -p "$FIX"
   : > "$OUT"
   RC=0
+  RUN_DIR=""
+  RUN_PATH=""
 }
 
 git_init_fixture() {
@@ -288,13 +297,40 @@ standard_fixture() {
 
 run_loop() {
   (
-    cd "$FIX" || exit 1
-    PATH="$MOCK_BIN:$PATH" \
+    cd "${RUN_DIR:-$FIX}" || exit 1
+    PATH="${RUN_PATH:-$MOCK_BIN:$PATH}" \
     MOCK_STATE="$TMP/mockstate" \
     MOCK_SCENARIO="${MOCK_SCENARIO:-ok}" \
       "$LOOP" "$@"
   ) < /dev/null > "$OUT" 2>&1
   RC=$?
+}
+
+# Everything a fixture added since the last commit. The loop refuses a dirty
+# work tree, so a case that drops a manifest or a config file into the fixture
+# has to commit it before running.
+commit_fixture() {
+  (
+    cd "$FIX" || exit 1
+    git add -A
+    git commit -qm "fixture: added files"
+  ) > /dev/null 2>&1
+}
+
+# A PATH with `gh` genuinely absent: symlinks to the tools the loop actually
+# uses and nothing else. RF-11 decides readiness from the document and the
+# progress record, so the whole graph has to resolve without it.
+GH_FREE_BIN=""
+
+make_gh_free_bin() {
+  GH_FREE_BIN="$TMP/nogh"
+  mkdir -p "$GH_FREE_BIN"
+  for mgb_tool in bash sh env git sed grep awk cut tr mkdir mv rm cp ln ls cat wc \
+    dirname basename date sha256sum shasum sort head tail chmod; do
+    mgb_path=$(command -v "$mgb_tool" 2> /dev/null)
+    [ -n "$mgb_path" ] || continue
+    ln -sf "$mgb_path" "$GH_FREE_BIN/$mgb_tool"
+  done
 }
 
 reset_engine_counters() {
@@ -327,6 +363,64 @@ seed_progress() {
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$sp_num" "$sp_hash" "$sp_state" "passed" "passed" "" >> "$sp_state_dir/progress.tsv"
   done < "$sp_state_dir/manifest.txt"
+}
+
+# One slice of the progress record, on the composite key the loop looks it up
+# by, leaving every other entry untouched.
+seed_progress_one() {
+  spo_dir="$1"
+  spo_num="$2"
+  spo_state="$3"
+  spo_file="$spo_dir/progress.tsv"
+  [ -f "$spo_file" ] || : > "$spo_file"
+  spo_hash=$(awk -F'|' -v n="$spo_num" '$2 == n { print $4 }' "$spo_dir/manifest.txt")
+  grep -v "^$spo_num${TAB}" "$spo_file" > "$spo_file.tmp"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$spo_num" "$spo_hash" "$spo_state" "passed" "passed" "" >> "$spo_file.tmp"
+  mv "$spo_file.tmp" "$spo_file"
+}
+
+# A minimal CT-01 document, one slice per argument, each argument being
+#   <number>|<title>|<Blocked by value>|<Issue field value>
+# Enough to carry a dependency graph, and no more.
+write_graph_issues() {
+  wgi_target="$1"
+  shift
+  mkdir -p "$(dirname "$wgi_target")"
+  {
+    echo "# Issues: graph"
+    echo
+    for wgi_spec in "$@"; do
+      wgi_num="${wgi_spec%%|*}"
+      wgi_rest="${wgi_spec#*|}"
+      wgi_title="${wgi_rest%%|*}"
+      wgi_rest="${wgi_rest#*|}"
+      wgi_blocked="${wgi_rest%%|*}"
+      wgi_issue="${wgi_rest#*|}"
+      echo "## Slice $wgi_num: [feat] $wgi_title"
+      echo
+      echo "- **Issue**: $wgi_issue"
+      echo "- **Tasks**: T0$wgi_num"
+      echo "- **Blocked by**: $wgi_blocked"
+      echo
+      echo "### Corpo"
+      echo
+      echo "## Critérios de aceite"
+      echo
+      echo "- [ ] $wgi_title exists"
+      echo
+      echo "---"
+      echo
+    done
+  } > "$wgi_target"
+}
+
+graph_fixture() {
+  gf_name="$1"
+  shift
+  new_fixture "$gf_name"
+  git_init_fixture
+  write_graph_issues "$FIX/.spec/features/demo/ISSUES.md" "$@"
 }
 
 # ---------------------------------------------------------------------------
@@ -915,6 +1009,402 @@ case_env_max_cycles_is_read() {
   MS_LOOP_TEST_CMD="make test" run_loop
   assert_eq "0" "$RC" "MS_LOOP_TEST_CMD does not disturb the preflight"
   assert_zero_engine_calls "environment variables"
+}
+
+# ---------------------------------------------------------------------------
+# Cases — test command resolution chain (T15: RF-16 to RF-20, UI-04)
+#
+# The precedence is proven PAIRWISE — each level against the one below it — so
+# a regression that collapses two levels into one cannot hide behind a case
+# that only exercises the top of the chain.
+# ---------------------------------------------------------------------------
+
+case_testcmd_flag_beats_environment() {
+  standard_fixture testcmd-flag-env
+  reset_engine_counters
+
+  MS_LOOP_TEST_CMD="make from-env" run_loop --test-cmd "make from-flag"
+  assert_eq "0" "$RC" "flag over environment: exit 0"
+  assert_contains "$OUT" "Suite gate: 'make from-flag' — resolved by the --test-cmd flag" "the flag resolves and names itself"
+  assert_not_contains "$OUT" "make from-env" "the environment variable was not used"
+}
+
+case_testcmd_environment_beats_declarative_config() {
+  standard_fixture testcmd-env-conf
+  printf 'test_cmd=make from-config\n' > "$FIX/.ms-harness.conf"
+  commit_fixture
+  reset_engine_counters
+
+  run_loop
+  assert_contains "$OUT" "Suite gate: 'make from-config' — resolved by the test_cmd key of .ms-harness.conf" "the declarative config resolves on its own"
+
+  MS_LOOP_TEST_CMD="make from-env" run_loop
+  assert_eq "0" "$RC" "environment over declarative config: exit 0"
+  assert_contains "$OUT" "Suite gate: 'make from-env' — resolved by the MS_LOOP_TEST_CMD environment variable" "the environment variable outranks .ms-harness.conf"
+  assert_not_contains "$OUT" "make from-config" "the declarative config was not used"
+}
+
+case_testcmd_config_beats_fallback_table() {
+  standard_fixture testcmd-conf-table
+  printf 'module example.test\n' > "$FIX/go.mod"
+  commit_fixture
+  reset_engine_counters
+
+  run_loop
+  assert_contains "$OUT" "resolved by the fallback table" "with no config, the table resolves"
+
+  printf '# the consumer declares its own command\ntest_cmd=make from-config\n' > "$FIX/.ms-harness.conf"
+  commit_fixture
+  run_loop
+  assert_eq "0" "$RC" "declarative config over fallback table: exit 0"
+  assert_contains "$OUT" "Suite gate: 'make from-config' — resolved by the test_cmd key of .ms-harness.conf" "the declarative config outranks the table"
+  assert_not_contains "$OUT" "fallback table" "no table entry is consulted once the config resolved"
+}
+
+case_testcmd_table_beats_disabled_gate() {
+  standard_fixture testcmd-table-none
+  reset_engine_counters
+
+  run_loop
+  assert_contains "$OUT" "Suite gate DISABLED: no test command resolved" "with nothing to go on, the gate is disabled"
+
+  printf 'module example.test\n' > "$FIX/go.mod"
+  commit_fixture
+  run_loop
+  assert_eq "0" "$RC" "fallback table over the disabled gate: exit 0"
+  assert_contains "$OUT" "Suite gate: 'go test ./...' — resolved by the fallback table" "a single table match re-enables the gate"
+  assert_not_contains "$OUT" "Suite gate DISABLED" "the gate is not disabled when the table resolved"
+}
+
+# Every row of scripts/test-commands.conf, one isolated fixture each: the table
+# is data, and this is the case that proves each row of that data is live.
+case_testcmd_one_fixture_per_supported_manifest() {
+  while IFS='|' read -r mf_file mf_content mf_expected; do
+    [ -n "$mf_file" ] || continue
+    standard_fixture "manifest-$(printf '%s' "$mf_file" | tr '.' '-')"
+    printf '%s\n' "$mf_content" > "$FIX/$mf_file"
+    commit_fixture
+    reset_engine_counters
+
+    run_loop
+    assert_eq "0" "$RC" "$mf_file alone: exit 0"
+    assert_contains "$OUT" "Suite gate: '$mf_expected' — resolved by the fallback table" \
+      "$mf_file resolves '$mf_expected' from the fallback table"
+  done <<'FIXTURES'
+composer.json|{ "scripts": { "test": "run-it" } }|composer test
+package.json|{ "scripts": { "test": "run-it" } }|npm test
+pytest.ini|[pytest]|pytest
+pyproject.toml|[tool.pytest.ini_options]|pytest
+go.mod|module example.test|go test ./...
+Cargo.toml|[package]|cargo test
+FIXTURES
+}
+
+case_testcmd_no_manifest_at_all_warns_and_runs() {
+  standard_fixture testcmd-no-manifest
+  reset_engine_counters
+
+  run_loop
+  assert_eq "0" "$RC" "a directory with no manifest at all still exits 0"
+  assert_contains "$OUT" "Suite gate DISABLED: no test command resolved" "the loud warning is printed"
+  assert_contains "$OUT" "never aborts the loop" "the warning says the run continues"
+  assert_contains "$OUT" "Run plan" "the run went on past the unresolved command"
+  assert_contains "$OUT" "Next ready slice: Slice 1" "the issue is still selected for execution"
+  assert_not_contains "$OUT" "Precondition not met" "an unresolved test command is not a precondition failure"
+}
+
+case_testcmd_two_manifests_disable_the_gate() {
+  standard_fixture testcmd-two-manifests
+  printf 'module example.test\n' > "$FIX/go.mod"
+  printf '[package]\nname = "example"\n' > "$FIX/Cargo.toml"
+  commit_fixture
+  reset_engine_counters
+
+  run_loop
+  assert_eq "0" "$RC" "two supported manifests: the run still exits 0"
+  assert_contains "$OUT" "the fallback table matched 2 rules" "the ambiguity is named"
+  assert_contains "$OUT" "matched: exists go.mod :: go test ./..." "the first matched candidate is listed"
+  assert_contains "$OUT" "matched: exists Cargo.toml :: cargo test" "the second matched candidate is listed"
+  assert_not_contains "$OUT" "Suite gate: " "neither candidate command was adopted"
+  assert_contains "$OUT" "Suite gate DISABLED" "the suite gate is disabled instead of picked"
+}
+
+# RF-18 AC: deleting the whole fallback table leaves the loop working through
+# the declarative config, which is what makes the table a fallback and not the
+# primary source.
+case_testcmd_emptied_table_still_resolves_through_config() {
+  standard_fixture testcmd-emptied-table
+  printf 'test_cmd=make from-config\n' > "$FIX/.ms-harness.conf"
+  printf 'module example.test\n' > "$FIX/go.mod"
+  commit_fixture
+
+  mkdir -p "$TMP/alt-scripts"
+  cp "$LOOP" "$TMP/alt-scripts/loop.sh"
+  chmod +x "$TMP/alt-scripts/loop.sh"
+  : > "$TMP/alt-scripts/test-commands.conf"
+
+  et_saved="$LOOP"
+  LOOP="$TMP/alt-scripts/loop.sh"
+  reset_engine_counters
+  run_loop
+  LOOP="$et_saved"
+
+  assert_eq "0" "$RC" "an emptied fallback table keeps the loop working"
+  assert_contains "$OUT" "Suite gate: 'make from-config' — resolved by the test_cmd key of .ms-harness.conf" "the declarative config resolves with the table gone"
+  assert_not_contains "$OUT" "go test ./..." "no table row survived to resolve anything"
+}
+
+# UI-04: in each of the five scenarios of the chain, the opening section names
+# the applied rule and names only that one.
+case_testcmd_opening_line_names_the_applied_rule() {
+  standard_fixture testcmd-opening-line
+  reset_engine_counters
+
+  run_loop --test-cmd "make from-flag"
+  assert_matches "$OUT" "Suite gate: 'make from-flag' — resolved by the --test-cmd flag$" "scenario 1 names the flag and nothing else"
+
+  MS_LOOP_TEST_CMD="make from-env" run_loop
+  assert_matches "$OUT" "Suite gate: 'make from-env' — resolved by the MS_LOOP_TEST_CMD environment variable$" "scenario 2 names the environment variable and nothing else"
+
+  printf 'test_cmd=make from-config\n' > "$FIX/.ms-harness.conf"
+  commit_fixture
+  run_loop
+  assert_matches "$OUT" "Suite gate: 'make from-config' — resolved by the test_cmd key of \.ms-harness\.conf$" "scenario 3 names the declarative config and nothing else"
+
+  rm -f "$FIX/.ms-harness.conf"
+  printf 'module example.test\n' > "$FIX/go.mod"
+  commit_fixture
+  run_loop
+  assert_matches "$OUT" "Suite gate: 'go test \./\.\.\.' — resolved by the fallback table .*test-commands\.conf, rule 'exists go\.mod'$" "scenario 4 names the table and the exact rule that matched"
+
+  rm -f "$FIX/go.mod"
+  commit_fixture
+  run_loop
+  assert_contains "$OUT" "Suite gate DISABLED: no test command resolved. Searched, in this order:" "scenario 5 names the disabled gate"
+  assert_contains "$OUT" "1. the --test-cmd flag" "the disabled-gate warning names level 1"
+  assert_contains "$OUT" "2. the MS_LOOP_TEST_CMD environment variable" "the disabled-gate warning names level 2"
+  assert_contains "$OUT" "3. the test_cmd key of .ms-harness.conf" "the disabled-gate warning names level 3"
+  assert_contains "$OUT" "test-commands.conf (no rule matched" "the disabled-gate warning names level 4"
+  assert_zero_engine_calls "the five resolution scenarios"
+}
+
+# RF-20: with both gates off the loop says so BEFORE any engine session, not
+# after the fact.
+case_testcmd_zero_gates_warns_before_the_first_session() {
+  standard_fixture testcmd-zero-gates
+  reset_engine_counters
+
+  run_loop --no-verify
+  assert_eq "0" "$RC" "both gates disabled: preflight and plan still complete"
+  assert_contains "$OUT" "NO MECHANICAL VALIDATION IS ACTIVE" "the zero-gates warning is printed"
+  assert_contains "$OUT" "recorded 'unverified', never 'done'" "the warning states the consequence"
+
+  zg_warn_line=$(grep -n "NO MECHANICAL VALIDATION IS ACTIVE" "$OUT" | cut -d: -f1)
+  zg_plan_line=$(grep -n "Run plan" "$OUT" | cut -d: -f1)
+  assert_eq "1" "$([ "$zg_warn_line" -lt "$zg_plan_line" ] && echo 1 || echo 0)" "the warning comes before the run plan, so before any engine session"
+  assert_zero_engine_calls "both gates disabled"
+
+  # One gate is enough to silence it.
+  run_loop --no-verify --test-cmd "make test"
+  assert_not_contains "$OUT" "NO MECHANICAL VALIDATION IS ACTIVE" "a resolved suite gate silences the zero-gates warning"
+  run_loop
+  assert_not_contains "$OUT" "NO MECHANICAL VALIDATION IS ACTIVE" "an enabled verifier gate silences it too"
+}
+
+# RF-17: the probe inspects the invocation directory ONLY — it never recurses
+# into a subdirectory and never climbs to a parent.
+case_testcmd_probe_inspects_the_invocation_directory_only() {
+  new_fixture testcmd-probe-scope
+  git_init_fixture
+  mkdir -p "$FIX/sub" "$FIX/inner"
+  printf 'module example.test\n' > "$FIX/go.mod"
+  printf '[package]\nname = "nested"\n' > "$FIX/sub/Cargo.toml"
+  write_standard_issues "$FIX/inner/.spec/features/demo/ISSUES.md"
+  commit_fixture
+  reset_engine_counters
+
+  RUN_DIR="$FIX/inner"
+  run_loop
+  RUN_DIR=""
+  assert_eq "0" "$RC" "probing from a subdirectory: exit 0"
+  assert_contains "$OUT" "Suite gate DISABLED: no test command resolved" "the manifest in the parent directory is not reached"
+  assert_not_contains "$OUT" "go test ./..." "no walk up to the parent directory happened"
+  assert_not_contains "$OUT" "cargo test" "no recursive scan into a subdirectory happened"
+}
+
+# RF-18 AC, as a static assertion on the script itself: the only place a
+# language or a package manager may be named is the data rows of the table.
+case_testcmd_loop_names_no_stack() {
+  new_fixture testcmd-no-stack
+  grep -nE 'laravel|artisan|vendor/bin|docker compose exec' "$LOOP" > "$OUT" 2>&1
+  assert_empty_file "$OUT" "loop.sh names no framework, container command or vendored binary path"
+
+  grep -niE '(^|[^[:alnum:]_-])sail([^[:alnum:]_-]|$)' "$LOOP" > "$OUT" 2>&1
+  assert_empty_file "$OUT" "loop.sh contains no occurrence of 'sail' in any case (RF-13)"
+}
+
+# ---------------------------------------------------------------------------
+# Cases — dependency graph and selection (T17: RF-11, RF-34 a, b)
+# ---------------------------------------------------------------------------
+
+case_graph_resolves_with_gh_absent_from_path() {
+  standard_fixture graph-no-gh
+  make_gh_free_bin
+  reset_engine_counters
+
+  RUN_PATH="$MOCK_BIN:$GH_FREE_BIN"
+  gn_gh=$(PATH="$RUN_PATH" command -v gh 2> /dev/null)
+  assert_eq "" "$gn_gh" "gh really is absent from the PATH the run uses"
+
+  run_loop
+  RUN_PATH=""
+  assert_eq "0" "$RC" "the graph resolves with gh absent from PATH: exit 0"
+  assert_contains "$OUT" "Execution order, from '- **Blocked by**:' alone: Slice 1 -> Slice 2 -> Slice 3" "the declared dependency order is honoured without gh"
+  assert_contains "$OUT" "Next ready slice: Slice 1" "the first ready slice is the one nothing blocks"
+}
+
+case_graph_never_queries_github() {
+  new_fixture graph-no-github
+  grep -nE '(^|[^[:alnum:]_./"-])gh([[:space:]]|$)' "$LOOP" | grep -vE '^[0-9]+:[[:space:]]*#' > "$OUT" 2>&1
+  assert_empty_file "$OUT" "loop.sh never invokes gh outside its own comments"
+}
+
+case_graph_blocker_not_done_is_never_selected() {
+  standard_fixture graph-readiness
+  reset_engine_counters
+
+  run_loop
+  assert_contains "$OUT" "Next ready slice: Slice 1" "a slice with an unfinished blocker is not selected"
+  assert_contains "$OUT" "3 slice(s) to execute, 0 skipped" "the blocked slices stay queued, they are not dropped"
+
+  # Only `done` advances the ready set.
+  for gr_state in unverified failed blocked; do
+    seed_progress_one "$(state_dir)" 1 "$gr_state"
+    run_loop
+    assert_contains "$OUT" "Next ready slice: Slice 1" "a blocker recorded '$gr_state' does not release Slice 2"
+  done
+
+  seed_progress_one "$(state_dir)" 1 "done"
+  run_loop
+  assert_contains "$OUT" "Next ready slice: Slice 2" "Slice 2 is released only once its blocker is recorded done"
+
+  seed_progress_one "$(state_dir)" 2 "done"
+  run_loop
+  assert_contains "$OUT" "Next ready slice: Slice 3" "selection walks the chain in dependency order"
+  assert_zero_engine_calls "graph readiness"
+}
+
+case_graph_external_block_is_reported_and_never_selected() {
+  graph_fixture graph-external \
+    "1|Ready|nenhum|não publicada" \
+    "2|Waiting on the world|#999|não publicada" \
+    "3|Independent|nenhum|não publicada"
+  reset_engine_counters
+
+  run_loop
+  assert_eq "0" "$RC" "an external block never makes the run fail"
+  assert_matches "$OUT" 'Slice 2 — blocked-external \(skip: blocked externally by #999\)' "the opening summary reports the slice as blocked-external"
+  assert_contains "$OUT" "Blocked externally — never selected, and never a reason for the run to fail:" "the opening summary has an explicit external-block section"
+  assert_contains "$OUT" "Slice 2 — waiting on #999, which matches no slice of .spec/features/demo/ISSUES.md" "the summary names the unmatched issue number"
+  assert_contains "$OUT" "2 slice(s) to execute, 1 skipped" "the externally blocked slice is out of the queue"
+  assert_matches "$(state_dir)/progress.tsv" "^2${TAB}[0-9a-f]{64}${TAB}blocked-external${TAB}disabled${TAB}disabled${TAB}" "the state is recorded, not only printed"
+
+  # It stays out of the selection at every point of the run, not only first.
+  seed_progress_one "$(state_dir)" 1 "done"
+  seed_progress_one "$(state_dir)" 3 "done"
+  run_loop
+  assert_eq "0" "$RC" "with everything else done, the run still exits 0"
+  assert_contains "$OUT" "No slice is ready to execute." "the externally blocked slice is never selected"
+  assert_zero_engine_calls "external block"
+}
+
+# RF-34b: propagation is TRANSITIVE. Slice 3 does not depend on the unreachable
+# slice directly — it depends on a slice that does — and it is blocked all the
+# same, with no engine session for either of them.
+case_graph_blocking_propagates_transitively() {
+  graph_fixture graph-transitive \
+    "1|A, unreachable|#999|não publicada" \
+    "2|B, depends on A|Slice 1|não publicada" \
+    "3|C, depends on B|Slice 2|não publicada" \
+    "4|D, independent|nenhum|não publicada"
+  reset_engine_counters
+
+  run_loop
+  assert_eq "0" "$RC" "transitive blocking alone never fails the run"
+  assert_matches "$OUT" 'Slice 1 — blocked-external \(skip: blocked externally by #999\)' "the root cause is reported as the external block it is"
+  assert_matches "$OUT" 'Slice 2 — blocked \(skip: blocked by Slice 1, which is blocked externally\)' "the direct dependent is blocked and the cause names the root"
+  assert_matches "$OUT" 'Slice 3 — blocked \(skip: blocked by Slice 1, which is blocked externally\)' "the indirect dependent is blocked transitively"
+  assert_matches "$OUT" 'Slice 4 — pending \(run\)' "an independent branch of the graph is untouched"
+  assert_contains "$OUT" "1 slice(s) to execute, 3 skipped" "only the independent slice is queued"
+  assert_contains "$OUT" "Next ready slice: Slice 4" "selection jumps straight to the reachable branch"
+
+  assert_matches "$(state_dir)/progress.tsv" "^2${TAB}[0-9a-f]{64}${TAB}blocked${TAB}disabled${TAB}disabled${TAB}" "the direct dependent is recorded blocked"
+  assert_matches "$(state_dir)/progress.tsv" "^3${TAB}[0-9a-f]{64}${TAB}blocked${TAB}disabled${TAB}disabled${TAB}" "the transitive dependent is recorded blocked"
+  assert_zero_engine_calls "transitive blocking"
+}
+
+# CT-01: `- **Blocked by**:` is the single parsed source. The `## Bloqueado por`
+# heading of the body is prose, and a divergence between the two is not an
+# error — the field wins and the prose is not read.
+case_graph_body_prose_heading_is_never_parsed() {
+  new_fixture graph-prose
+  git_init_fixture
+  mkdir -p "$FIX/.spec/features/demo"
+  cat > "$FIX/.spec/features/demo/ISSUES.md" <<'DOC'
+# Issues: prose
+
+## Slice 1: [feat] First
+
+- **Issue**: não publicada
+- **Blocked by**: nenhum
+
+### Corpo
+
+## Bloqueado por
+
+Slice 2 e a issue #999 — prosa para quem lê, nunca parseada.
+
+---
+
+## Slice 2: [feat] Second
+
+- **Issue**: não publicada
+- **Blocked by**: nenhum
+
+### Corpo
+
+## Bloqueado por
+
+Nada.
+DOC
+  reset_engine_counters
+
+  run_loop
+  assert_eq "0" "$RC" "a divergence between the field and the body prose is not an error"
+  assert_not_contains "$OUT" "blocked-external" "the #999 named only in the prose creates no external block"
+  assert_not_contains "$OUT" "has a cycle" "the prose naming Slice 2 creates no edge and so no cycle"
+  assert_contains "$OUT" "Execution order, from '- **Blocked by**:' alone: Slice 1 -> Slice 2" "the field alone builds the graph"
+  assert_contains "$OUT" "2 slice(s) to execute, 0 skipped" "both slices are runnable, as their fields declare"
+}
+
+# RF-11: a `#<n>` blocker that DOES match a slice of this same document is an
+# ordinary edge, not an external block.
+case_graph_issue_number_blocker_matching_a_slice_is_an_edge() {
+  graph_fixture graph-issue-edge \
+    "1|Published first|nenhum|#42" \
+    "2|Blocked by the published one|#42|não publicada"
+  reset_engine_counters
+
+  run_loop
+  assert_eq "0" "$RC" "an issue-number blocker matching a slice: exit 0"
+  assert_not_contains "$OUT" "blocked-external" "#42 matches Slice 1, so it is not an external block"
+  assert_contains "$OUT" "Execution order, from '- **Blocked by**:' alone: Slice 1 -> Slice 2" "the issue number resolves to an edge"
+  assert_contains "$OUT" "Next ready slice: Slice 1" "Slice 2 waits on the slice that carries #42"
+
+  seed_progress_one "$(state_dir)" 1 "done"
+  run_loop
+  assert_contains "$OUT" "Next ready slice: Slice 2" "Slice 2 is released once #42's slice is recorded done"
+  assert_zero_engine_calls "issue-number edge"
 }
 
 # ---------------------------------------------------------------------------
