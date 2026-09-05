@@ -103,6 +103,8 @@ scenario="${MOCK_SCENARIO:-ok}"
 name=$(basename "$0")
 verify=0
 prompt=""
+sandbox=""
+allowed=""
 
 mkdir -p "$state"
 
@@ -116,14 +118,14 @@ bump() {
 }
 
 # A real `claude -p` reads stdin when it is not a TTY. If the loop ever forgets
-# to close stdin, the mock swallows the caller's stream and the run hangs or
+# to redirect stdin, the mock swallows the caller's stream and the run hangs or
 # skips work — so the mock reads it on purpose and the suite notices.
 if [ "$name" = "claude" ]; then
   [ -t 0 ] || cat > /dev/null
   while [ $# -gt 0 ]; do
     case "$1" in
       -p) prompt="${2:-}"; shift 2 ;;
-      --allowedTools) verify=1; shift 2 ;;
+      --allowedTools) allowed="${2:-}"; verify=1; shift 2 ;;
       *) shift ;;
     esac
   done
@@ -131,7 +133,8 @@ else
   while [ $# -gt 0 ]; do
     case "$1" in
       --sandbox)
-        [ "${2:-}" = "read-only" ] && verify=1
+        sandbox="${2:-}"
+        [ "$sandbox" = "read-only" ] && verify=1
         shift 2
         ;;
       *) shift ;;
@@ -142,10 +145,70 @@ fi
 
 echo "$name $scenario" >> "$state/invocations"
 
+# The slice under work, read out of the prompt the loop built. Everything this
+# mock does is a function of the REAL fixture files, never of a canned answer.
+slice=$(printf '%s\n' "$prompt" | grep -oE '^## Slice [0-9]+' | head -1 | grep -oE '[0-9]+' || true)
+[ -n "$slice" ] || slice=0
+marker="impl-slice-$slice.txt"
+
 if [ "$verify" -eq 1 ]; then
   bump verify_calls > /dev/null
-else
-  bump impl_calls > /dev/null
+  echo "$name verify sandbox=$sandbox allowedTools=$allowed" >> "$state/verify_args"
+
+  expected=$(printf '%s\n' "$prompt" | awk '
+    /^## Checkboxes to judge/ { inside = 1; next }
+    /^## / { inside = 0 }
+    inside && /^[[:space:]]*- \[/ { count++ }
+    END { print count + 0 }
+  ')
+
+  case "$scenario" in
+    verify-extra) expected=$((expected + 1)) ;;
+    verify-short) expected=$((expected - 1)) ;;
+    verify-garbage)
+      echo "Everything looks broadly fine to me; I did not itemise it."
+      exit 0
+      ;;
+  esac
+
+  i=1
+  while [ "$i" -le "$expected" ]; do
+    if [ -f "$marker" ]; then
+      echo "CRITERION $i: DONE — $marker:1"
+    else
+      echo "CRITERION $i: INCOMPLETE — $marker does not exist"
+    fi
+    i=$((i + 1))
+  done
+  exit 0
+fi
+
+bump impl_calls > /dev/null
+attempts=$(bump "impl_calls_slice_$slice")
+echo "$name impl sandbox=$sandbox" >> "$state/impl_args"
+
+# The usage-limit message lands at the END of the log, which is the only place
+# the loop looks for it.
+if [ "$scenario" = "usage-limit-once" ] && [ ! -f "$state/limit_hit_$slice" ]; then
+  : > "$state/limit_hit_$slice"
+  echo "usage limit reached, try again after the reset"
+  exit 0
+fi
+
+write=1
+case "$scenario" in
+  noop) write=0 ;;
+  green-cycle-2) [ "$attempts" -ge 2 ] || write=0 ;;
+esac
+
+if [ "$write" -eq 1 ] && [ "$slice" != "0" ]; then
+  echo "work of slice $slice, session $attempts" >> "$marker"
+fi
+
+# `claude -p --output-format json` is the impl invocation, and the loop reads
+# the completion signal out of that stream.
+if [ "$name" = "claude" ]; then
+  echo '{"type":"result","is_error":false,"subtype":"success"}'
 fi
 
 exit 0
@@ -155,6 +218,18 @@ MOCK
   for engine in claude codex; do
     cp "$MOCK_BIN/mock-engine" "$MOCK_BIN/$engine"
     chmod +x "$MOCK_BIN/$engine"
+  done
+
+  # The consumer project's suite is mocked too: the suite gate runs a real
+  # command, and these are the command names the resolution chain can produce
+  # in a fixture. They pass unless a case deliberately makes one fail.
+  for runner in make go cargo npm composer pytest; do
+    cat > "$MOCK_BIN/$runner" <<'RUNNER'
+#!/usr/bin/env bash
+echo "mock suite: $(basename "$0") $*"
+exit 0
+RUNNER
+    chmod +x "$MOCK_BIN/$runner"
   done
 }
 
@@ -380,6 +455,30 @@ seed_progress_one() {
   mv "$spo_file.tmp" "$spo_file"
 }
 
+# Drops one slice from the progress record, leaving every other entry alone —
+# the counterpart of seed_progress_one, for cases that need a slice to look
+# unexecuted while the others keep their recorded state.
+clear_progress_one() {
+  cpo_file="$1/progress.tsv"
+  [ -f "$cpo_file" ] || return 0
+  grep -v "^$2${TAB}" "$cpo_file" > "$cpo_file.tmp" || true
+  mv "$cpo_file.tmp" "$cpo_file"
+}
+
+# The number of prompt files of a kind under the state directory: one file per
+# engine session, which is how "a session is never reused" is counted.
+prompt_files() {
+  pf_count=0
+  for pf_path in "$1"/prompts/*"$2"*; do
+    [ -f "$pf_path" ] && pf_count=$((pf_count + 1))
+  done
+  printf '%s' "$pf_count"
+}
+
+new_commits_since() {
+  (cd "$FIX" && git rev-list --count "$1..HEAD")
+}
+
 # A minimal CT-01 document, one slice per argument, each argument being
 #   <number>|<title>|<Blocked by value>|<Issue field value>
 # Enough to carry a dependency graph, and no more.
@@ -414,6 +513,44 @@ write_graph_issues() {
     done
   } > "$wgi_target"
 }
+
+# A one-slice CT-01 document with a chosen number of acceptance criteria: the
+# smallest fixture that can exercise a gate end to end, and the one the CT-07
+# count rule needs when it has to emit one line fewer than there are
+# checkboxes.
+write_single_issue() {
+  wsi_target="$1"
+  wsi_criteria="$2"
+  mkdir -p "$(dirname "$wsi_target")"
+  {
+    echo "# Issues: single"
+    echo
+    echo "## Slice 1: [feat] The only slice"
+    echo
+    echo "- **Issue**: não publicada"
+    echo "- **Tasks**: T01"
+    echo "- **Blocked by**: nenhum"
+    echo "- **Demoável por**: the marker file exists"
+    echo
+    echo "### Corpo"
+    echo
+    echo "## Critérios de aceite"
+    echo
+    wsi_i=1
+    while [ "$wsi_i" -le "$wsi_criteria" ]; do
+      echo "- [ ] criterion $wsi_i is met"
+      wsi_i=$((wsi_i + 1))
+    done
+  } > "$wsi_target"
+}
+
+single_fixture() {
+  new_fixture "$1"
+  git_init_fixture
+  write_single_issue "$FIX/.spec/features/demo/ISSUES.md" "${2:-1}"
+}
+
+head_rev() { (cd "$FIX" && git rev-parse HEAD); }
 
 graph_fixture() {
   gf_name="$1"
@@ -482,7 +619,7 @@ case_input_positional_wins() {
   assert_eq "0" "$RC" "positional argument: exit 0"
   assert_contains "$OUT" "resolved by positional argument" "positional argument is the rule that resolved"
   assert_contains "$OUT" "state: .spec/features/other/.loop" "state dir follows the positional input"
-  assert_zero_engine_calls "positional argument"
+  assert_eq "3" "$(impl_sessions)" "one implementation session per slice of the document that resolved"
 }
 
 case_input_single_feature_glob() {
@@ -493,7 +630,7 @@ case_input_single_feature_glob() {
   assert_eq "0" "$RC" "single feature ISSUES.md: exit 0"
   assert_contains "$OUT" "resolved by the single .spec/features/*/ISSUES.md" "the feature glob is the rule that resolved"
   assert_contains "$OUT" "state: .spec/features/demo/.loop" "state dir sits beside the feature document"
-  assert_zero_engine_calls "single feature ISSUES.md"
+  assert_eq "3" "$(impl_sessions)" "the three slices of the resolved document are executed"
 }
 
 case_input_init_artifact() {
@@ -506,7 +643,7 @@ case_input_init_artifact() {
   assert_eq "0" "$RC" "init chain artifact: exit 0"
   assert_contains "$OUT" "resolved by the init chain artifact .spec/init/project-issues.md" "the init artifact is the rule that resolved"
   assert_contains "$OUT" "state: .spec/init/.loop" "init chain state dir is .spec/init/.loop"
-  assert_zero_engine_calls "init chain artifact"
+  assert_eq "3" "$(impl_sessions)" "the init chain artifact executes exactly like ISSUES.md"
 }
 
 case_input_feature_glob_beats_init_artifact() {
@@ -518,7 +655,7 @@ case_input_feature_glob_beats_init_artifact() {
   assert_eq "0" "$RC" "feature glob over init artifact: exit 0"
   assert_contains "$OUT" "resolved by the single .spec/features/*/ISSUES.md" "the feature glob outranks the init artifact"
   assert_not_contains "$OUT" "state: .spec/init/.loop" "the init artifact was not used"
-  assert_zero_engine_calls "feature glob over init artifact"
+  assert_eq "3" "$(impl_sessions)" "only the slices of the winning document were executed"
 }
 
 case_input_tie_aborts_listing_candidates() {
@@ -803,13 +940,22 @@ case_split_trailing_section_does_not_leak() {
   assert_contains "$(state_dir)/slices/slice-03.md" "a terceira camada existe" "the last slice still carries its own body"
 }
 
+# The loop itself writes nothing outside .spec/, so the case runs with sessions
+# that write nothing at all: the work is already in HEAD, the verifier confirms
+# it against the real files, and whatever appears in git status afterwards can
+# only have been put there by the loop.
 case_split_writes_nothing_outside_spec() {
   standard_fixture split-scope
+  for ss_num in 1 2 3; do
+    echo "already implemented" > "$FIX/impl-slice-$ss_num.txt"
+  done
+  commit_fixture
   reset_engine_counters
 
   ss_before=$(cd "$FIX" && git rev-parse HEAD)
-  run_loop
+  MOCK_SCENARIO=noop run_loop
   assert_eq "0" "$RC" "run over a clean tree: exit 0"
+  assert_contains "$OUT" "ALREADY IMPLEMENTED in HEAD" "a session that writes nothing over green gates is not a failure"
 
   (cd "$FIX" && git status --porcelain) > "$TMP/status.txt"
   assert_empty_file "$TMP/status.txt" "git status --porcelain lists no path at all after a run"
@@ -817,7 +963,7 @@ case_split_writes_nothing_outside_spec() {
   ss_outside=$(cd "$FIX" && git status --porcelain --ignored=no | grep -v '^.. \.spec/' || true)
   assert_eq "" "$ss_outside" "no path outside .spec/ appears in git status"
 
-  assert_eq "$ss_before" "$(cd "$FIX" && git rev-parse HEAD)" "the split creates no commit"
+  assert_eq "$ss_before" "$(cd "$FIX" && git rev-parse HEAD)" "an issue already implemented in HEAD creates no commit"
   assert_contains "$FIX/.git/info/exclude" "/.spec/features/demo/.loop/" "the state dir is registered in .git/info/exclude"
   assert_not_contains "$FIX/.gitignore" ".loop" "the consumer .gitignore is never touched" 2> /dev/null || ok "the consumer .gitignore is never created"
 }
@@ -979,6 +1125,7 @@ case_cli_surface_is_accepted() {
   run_loop --engine claude --test-cmd "make test" --max-cycles 5 --no-verify --keep-going
   assert_eq "0" "$RC" "the full flag surface is accepted"
   assert_contains "$OUT" "engine: claude" "--engine selects the engine"
+  assert_contains "$OUT" "Suite gate — green" "the suite gate really ran the command the flag gave it"
 
   run_loop --engine perl
   assert_ne "0" "$RC" "an unknown engine is rejected"
@@ -991,7 +1138,7 @@ case_cli_surface_is_accepted() {
   assert_eq "0" "$RC" "--help exits 0"
   assert_contains "$OUT" "MS_LOOP_MAX_LIMIT_WAITS" "the header documents every environment variable"
   assert_contains "$OUT" "MS_LOOP_LABEL" "the header documents the triage label variable"
-  assert_zero_engine_calls "cli surface"
+  assert_contains "$OUT" "MS_LOOP_ISSUE_NUM" "the header documents the per-issue context exported for consumer hooks"
 }
 
 case_env_max_cycles_is_read() {
@@ -1008,7 +1155,6 @@ case_env_max_cycles_is_read() {
 
   MS_LOOP_TEST_CMD="make test" run_loop
   assert_eq "0" "$RC" "MS_LOOP_TEST_CMD does not disturb the preflight"
-  assert_zero_engine_calls "environment variables"
 }
 
 # ---------------------------------------------------------------------------
@@ -1185,7 +1331,6 @@ case_testcmd_opening_line_names_the_applied_rule() {
   assert_contains "$OUT" "2. the MS_LOOP_TEST_CMD environment variable" "the disabled-gate warning names level 2"
   assert_contains "$OUT" "3. the test_cmd key of .ms-harness.conf" "the disabled-gate warning names level 3"
   assert_contains "$OUT" "test-commands.conf (no rule matched" "the disabled-gate warning names level 4"
-  assert_zero_engine_calls "the five resolution scenarios"
 }
 
 # RF-20: with both gates off the loop says so BEFORE any engine session, not
@@ -1195,17 +1340,26 @@ case_testcmd_zero_gates_warns_before_the_first_session() {
   reset_engine_counters
 
   run_loop --no-verify
-  assert_eq "0" "$RC" "both gates disabled: preflight and plan still complete"
+  assert_ne "0" "$RC" "both gates disabled: the run exits non-zero"
   assert_contains "$OUT" "NO MECHANICAL VALIDATION IS ACTIVE" "the zero-gates warning is printed"
   assert_contains "$OUT" "recorded 'unverified', never 'done'" "the warning states the consequence"
 
   zg_warn_line=$(grep -n "NO MECHANICAL VALIDATION IS ACTIVE" "$OUT" | cut -d: -f1)
   zg_plan_line=$(grep -n "Run plan" "$OUT" | cut -d: -f1)
   assert_eq "1" "$([ "$zg_warn_line" -lt "$zg_plan_line" ] && echo 1 || echo 0)" "the warning comes before the run plan, so before any engine session"
-  assert_zero_engine_calls "both gates disabled"
+
+  zg_first_session=$(grep -n "Slice 1:" "$OUT" | head -1 | cut -d: -f1)
+  assert_eq "1" "$([ "$zg_warn_line" -lt "$zg_first_session" ] && echo 1 || echo 0)" "the warning precedes the first engine session of the run"
+  assert_eq "0" "$(grep -c "${TAB}done${TAB}" "$(state_dir)/progress.tsv")" "no issue of a zero-gates run is recorded done"
+  assert_eq "1" "$(grep -c "${TAB}unverified${TAB}" "$(state_dir)/progress.tsv")" "the executed issue is recorded unverified instead"
+  # And the consequence of never reaching `done`: an `unverified` blocker
+  # releases nothing, exactly as an unfinished blocker of any other kind.
+  assert_eq "2" "$(grep -c "${TAB}blocked${TAB}" "$(state_dir)/progress.tsv")" "the slices behind it stay blocked, because no issue of this run is done"
 
   # One gate is enough to silence it.
+  reset_engine_counters
   run_loop --no-verify --test-cmd "make test"
+  assert_eq "0" "$RC" "one active gate is enough to reach a real verdict"
   assert_not_contains "$OUT" "NO MECHANICAL VALIDATION IS ACTIVE" "a resolved suite gate silences the zero-gates warning"
   run_loop
   assert_not_contains "$OUT" "NO MECHANICAL VALIDATION IS ACTIVE" "an enabled verifier gate silences it too"
@@ -1287,22 +1441,29 @@ case_graph_blocker_not_done_is_never_selected() {
   run_loop
   assert_contains "$OUT" "Next ready slice: Slice 1" "a slice with an unfinished blocker is not selected"
   assert_contains "$OUT" "3 slice(s) to execute, 0 skipped" "the blocked slices stay queued, they are not dropped"
+  assert_eq "0" "$RC" "the chain runs to the end in dependency order"
 
-  # Only `done` advances the ready set.
+  # Only `done` advances the ready set: every other recorded state leaves the
+  # blocker unfinished, and the slices it blocks stay behind it.
   for gr_state in unverified failed blocked; do
     seed_progress_one "$(state_dir)" 1 "$gr_state"
+    clear_progress_one "$(state_dir)" 2
+    clear_progress_one "$(state_dir)" 3
     run_loop
     assert_contains "$OUT" "Next ready slice: Slice 1" "a blocker recorded '$gr_state' does not release Slice 2"
   done
 
   seed_progress_one "$(state_dir)" 1 "done"
+  clear_progress_one "$(state_dir)" 2
+  clear_progress_one "$(state_dir)" 3
   run_loop
   assert_contains "$OUT" "Next ready slice: Slice 2" "Slice 2 is released only once its blocker is recorded done"
 
+  seed_progress_one "$(state_dir)" 1 "done"
   seed_progress_one "$(state_dir)" 2 "done"
+  clear_progress_one "$(state_dir)" 3
   run_loop
   assert_contains "$OUT" "Next ready slice: Slice 3" "selection walks the chain in dependency order"
-  assert_zero_engine_calls "graph readiness"
 }
 
 case_graph_external_block_is_reported_and_never_selected() {
@@ -1323,10 +1484,11 @@ case_graph_external_block_is_reported_and_never_selected() {
   # It stays out of the selection at every point of the run, not only first.
   seed_progress_one "$(state_dir)" 1 "done"
   seed_progress_one "$(state_dir)" 3 "done"
+  reset_engine_counters
   run_loop
   assert_eq "0" "$RC" "with everything else done, the run still exits 0"
   assert_contains "$OUT" "No slice is ready to execute." "the externally blocked slice is never selected"
-  assert_zero_engine_calls "external block"
+  assert_zero_engine_calls "external block, second run"
 }
 
 # RF-34b: propagation is TRANSITIVE. Slice 3 does not depend on the unreachable
@@ -1351,7 +1513,7 @@ case_graph_blocking_propagates_transitively() {
 
   assert_matches "$(state_dir)/progress.tsv" "^2${TAB}[0-9a-f]{64}${TAB}blocked${TAB}disabled${TAB}disabled${TAB}" "the direct dependent is recorded blocked"
   assert_matches "$(state_dir)/progress.tsv" "^3${TAB}[0-9a-f]{64}${TAB}blocked${TAB}disabled${TAB}disabled${TAB}" "the transitive dependent is recorded blocked"
-  assert_zero_engine_calls "transitive blocking"
+  assert_eq "1" "$(impl_sessions)" "only the reachable branch reached an engine session"
 }
 
 # CT-01: `- **Blocked by**:` is the single parsed source. The `## Bloqueado por`
@@ -1371,6 +1533,10 @@ case_graph_body_prose_heading_is_never_parsed() {
 
 ### Corpo
 
+## Critérios de aceite
+
+- [ ] a primeira fatia existe
+
 ## Bloqueado por
 
 Slice 2 e a issue #999 — prosa para quem lê, nunca parseada.
@@ -1383,6 +1549,10 @@ Slice 2 e a issue #999 — prosa para quem lê, nunca parseada.
 - **Blocked by**: nenhum
 
 ### Corpo
+
+## Critérios de aceite
+
+- [ ] a segunda fatia existe
 
 ## Bloqueado por
 
@@ -1413,18 +1583,16 @@ case_graph_issue_number_blocker_matching_a_slice_is_an_edge() {
   assert_contains "$OUT" "Next ready slice: Slice 1" "Slice 2 waits on the slice that carries #42"
 
   seed_progress_one "$(state_dir)" 1 "done"
+  clear_progress_one "$(state_dir)" 2
   run_loop
   assert_contains "$OUT" "Next ready slice: Slice 2" "Slice 2 is released once #42's slice is recorded done"
-  assert_zero_engine_calls "issue-number edge"
 }
 
-# RF-34a/b with a `failed` root. The run loop that ends a slice `failed` is a
-# later task, so the entry point it will call is driven here on a patched copy
-# of the script — the harness's sanctioned way of reaching a path main() does
-# not reach yet. What is asserted is the propagation itself: the whole cone
-# downstream of the failure, at any depth, recorded `blocked` with the failure
-# named as the cause, an independent branch untouched, and no engine session
-# for any of them.
+# RF-34a/b with a `failed` root, driven through the real execution path: the
+# session writes nothing, the verifier judges the real files and reproves, the
+# single correction cycle is spent and the issue ends `failed`. From there the
+# whole cone downstream of it goes down transitively, with no engine session
+# for any of them, and the run exits non-zero.
 case_graph_failure_propagates_transitively() {
   graph_fixture graph-failed-root \
     "1|A, the one that fails|nenhum|não publicada" \
@@ -1433,24 +1601,21 @@ case_graph_failure_propagates_transitively() {
     "4|D, independent|nenhum|não publicada"
   reset_engine_counters
 
-  gf_dir="$TMP/failed-root-scripts"
-  mkdir -p "$gf_dir"
-  sed 's/^  print_run_plan$/  print_run_plan\
-  mark_dependents_of_failure 1/' "$LOOP" > "$gf_dir/loop.sh"
-  chmod +x "$gf_dir/loop.sh"
-  cp "$(dirname "$LOOP")/test-commands.conf" "$gf_dir/test-commands.conf"
-  assert_ne "0" "$(grep -c 'mark_dependents_of_failure 1' "$gf_dir/loop.sh")" "the patched copy really drives the failure path"
-
-  gf_saved="$LOOP"
-  LOOP="$gf_dir/loop.sh"
-  run_loop
-  LOOP="$gf_saved"
-
-  assert_eq "0" "$RC" "marking the cone of a failed slice is not itself an error"
+  MOCK_SCENARIO=noop run_loop --max-cycles 1
+  assert_ne "0" "$RC" "an issue that ends failed makes the run exit non-zero"
+  assert_matches "$(state_dir)/progress.tsv" "^1${TAB}[0-9a-f]{64}${TAB}failed${TAB}" "the root issue is recorded failed"
   assert_matches "$(state_dir)/progress.tsv" "^2${TAB}[0-9a-f]{64}${TAB}blocked${TAB}disabled${TAB}disabled${TAB}blocked by Slice 1, which failed$" "the direct dependent of the failed slice is recorded blocked, cause named"
   assert_matches "$(state_dir)/progress.tsv" "^3${TAB}[0-9a-f]{64}${TAB}blocked${TAB}disabled${TAB}disabled${TAB}blocked by Slice 1, which failed$" "the indirect dependent is recorded blocked transitively"
-  assert_eq "0" "$(grep -c "^4${TAB}" "$(state_dir)/progress.tsv")" "the independent branch is not touched by the failure"
-  assert_zero_engine_calls "failure propagation"
+  assert_eq "1" "$(impl_sessions)" "the engine is invoked for the failed issue only"
+  assert_contains "$OUT" "Stopping at the first failed issue" "the default behaviour is to stop at the first failure"
+  assert_eq "0" "$(new_commits_since "$(cd "$FIX" && git rev-list --max-parents=0 HEAD)")" "neither the failed issue nor a blocked one produced a commit"
+
+  # --keep-going carries on into the branch the failure does not reach.
+  reset_engine_counters
+  MOCK_SCENARIO=noop run_loop --max-cycles 1 --keep-going
+  assert_ne "0" "$RC" "--keep-going still exits non-zero when an issue failed"
+  assert_contains "$OUT" "--keep-going: moving on to the other branches of the graph" "the flag is what carries the run on"
+  assert_matches "$OUT" "Slice 4: \\[feat\\] D, independent" "an independent branch of the graph still executes after the failure"
 }
 
 # RF-11 / CT-01, as a static assertion: `## Bloqueado por` may be named in the
@@ -1462,6 +1627,245 @@ case_graph_prose_heading_is_not_a_parsing_source() {
 
   grep -c '\*\*Blocked by\*\*' "$LOOP" > "$OUT" 2>&1
   assert_ne "0" "$(cat "$OUT")" "the field that IS parsed is the one the contract names"
+}
+
+# ---------------------------------------------------------------------------
+# Cases — gates and the CT-07 verdict protocol (T16: RF-10, RF-20, CT-07)
+# ---------------------------------------------------------------------------
+
+# RF-10: the engine exit code is never a verdict of completion. The mock exits
+# 0 and writes nothing; the verifier judges the real files and reproves, so the
+# issue ends failed with no commit.
+case_gate_engine_exit_zero_without_writing_fails_the_issue() {
+  single_fixture gate-noop
+  reset_engine_counters
+  gz_before=$(head_rev)
+
+  MOCK_SCENARIO=noop run_loop --max-cycles 1
+  assert_ne "0" "$RC" "an engine that exits 0 without writing does not approve the issue"
+  assert_contains "$OUT" "The session wrote nothing" "the empty session is reported as the signal it is"
+  assert_contains "$OUT" "Verifier gate red" "the verdict came from a gate, never from the exit code"
+  assert_matches "$(state_dir)/progress.tsv" "^1${TAB}[0-9a-f]{64}${TAB}failed${TAB}" "the issue is recorded failed"
+  assert_eq "$gz_before" "$(head_rev)" "a failed issue produces no commit"
+  assert_eq "1" "$(impl_sessions)" "one implementation session for the single cycle"
+}
+
+# The suite gate runs the resolved command OUTSIDE the agent session and hands
+# its REAL output to the correction cycle, which is what a fresh session needs
+# in order to fix anything.
+case_gate_red_suite_fails_then_the_correction_cycle_makes_one_commit() {
+  single_fixture gate-suite-red
+  cat > "$FIX/fake-suite.sh" <<'SUITE'
+#!/usr/bin/env bash
+if [ -f .suite-was-run ]; then
+  echo "fake suite: 1 passed"
+  exit 0
+fi
+: > .suite-was-run
+echo "fake suite: 1 failed — assertion 'the alicerce exists' did not hold"
+exit 1
+SUITE
+  chmod +x "$FIX/fake-suite.sh"
+  commit_fixture
+  reset_engine_counters
+  gs_before=$(head_rev)
+
+  run_loop --test-cmd "./fake-suite.sh"
+  assert_eq "0" "$RC" "a red suite that goes green in a correction cycle ends green"
+  assert_contains "$OUT" "Suite gate red" "the red suite is reported"
+  assert_contains "$OUT" "Correction cycle 2/3" "a correction cycle runs after the red gate"
+  assert_eq "1" "$(new_commits_since "$gs_before")" "exactly one commit covers the issue, created only after the gates went green"
+  assert_contains "$(state_dir)/prompts/slice-01.cycle-2.txt" "assertion 'the alicerce exists' did not hold" \
+    "the correction prompt carries the REAL cause, not a generic 'the tests failed'"
+  assert_contains "$(state_dir)/prompts/slice-01.cycle-2.txt" "./fake-suite.sh" "the correction prompt names the command that went red"
+  assert_matches "$(state_dir)/progress.tsv" "^1${TAB}[0-9a-f]{64}${TAB}done${TAB}passed${TAB}passed${TAB}" "both gate results are recorded"
+}
+
+# RNF-08: the verifier judges code it can never edit.
+case_gate_verifier_session_is_read_only() {
+  single_fixture gate-readonly
+  reset_engine_counters
+
+  run_loop
+  assert_eq "0" "$RC" "the run completes"
+  assert_contains "$TMP/mockstate/verify_args" "sandbox=read-only" "the codex verifier session runs read-only"
+  assert_not_contains "$TMP/mockstate/impl_args" "sandbox=read-only" "the implementation session is not the read-only one"
+
+  single_fixture gate-readonly-claude
+  reset_engine_counters
+  run_loop --engine claude
+  assert_eq "0" "$RC" "the run completes on the other engine too"
+  assert_contains "$TMP/mockstate/verify_args" "allowedTools=Read,Glob,Grep" "the claude verifier session gets read-only tools only"
+}
+
+# CT-07 anti-gaming: the verdict is red whenever the parsed line count differs
+# from the checkbox count, EVEN when every line emitted says DONE.
+case_gate_verifier_count_divergence_is_red() {
+  single_fixture gate-count-extra 2
+  reset_engine_counters
+  MOCK_SCENARIO=verify-extra run_loop --max-cycles 1
+  assert_ne "0" "$RC" "more verdict lines than checkboxes is red"
+  assert_contains "$OUT" "emitted 3 verdict line(s) for 2 acceptance criteria" "the divergence is named with both counts"
+  assert_not_contains "$OUT" "INCOMPLETE" "every line the verifier emitted said DONE, and it is still red"
+
+  single_fixture gate-count-short 2
+  reset_engine_counters
+  MOCK_SCENARIO=verify-short run_loop --max-cycles 1
+  assert_ne "0" "$RC" "fewer verdict lines than checkboxes is red"
+  assert_contains "$OUT" "emitted 1 verdict line(s) for 2 acceptance criteria" "the short verdict is named with both counts"
+}
+
+case_gate_verifier_zero_parsed_lines_is_red() {
+  single_fixture gate-garbage
+  reset_engine_counters
+
+  MOCK_SCENARIO=verify-garbage run_loop --max-cycles 1
+  assert_ne "0" "$RC" "a verdict that parses to zero lines is red"
+  assert_contains "$OUT" "emitted no 'CRITERION <n>: DONE|INCOMPLETE' line at all" "the missing protocol is named"
+  assert_matches "$(state_dir)/progress.tsv" "^1${TAB}[0-9a-f]{64}${TAB}failed${TAB}" "the issue is recorded failed"
+}
+
+# INCOMPLETE once, then DONE: the correction cycle is fed the verifier's own
+# lines and the issue ends with exactly one commit.
+case_gate_verifier_incomplete_then_done() {
+  single_fixture gate-verify-cycle
+  reset_engine_counters
+  gv_before=$(head_rev)
+
+  MOCK_SCENARIO=green-cycle-2 run_loop
+  assert_eq "0" "$RC" "an issue completed in the second cycle ends green"
+  assert_contains "$(state_dir)/prompts/slice-01.cycle-2.txt" "CRITERION 1: INCOMPLETE" "the correction prompt carries the verifier's real lines"
+  assert_eq "1" "$(new_commits_since "$gv_before")" "exactly one commit, after the gates went green"
+  assert_eq "2" "$(impl_sessions)" "two implementation sessions: the first attempt and one correction cycle"
+  assert_eq "2" "$(verify_sessions)" "verifier sessions are counted separately"
+}
+
+# RNF-06: a usage limit is not a failed attempt. The loop waits and re-runs the
+# SAME issue on the SAME cycle, so no correction cycle is consumed.
+case_usage_limit_waits_and_reruns_the_same_issue() {
+  single_fixture usage-limit
+  reset_engine_counters
+
+  MS_LOOP_LIMIT_WAIT_DEFAULT=1 MS_LOOP_LIMIT_BUFFER=1 \
+    MOCK_SCENARIO=usage-limit-once run_loop --max-cycles 1
+  assert_eq "0" "$RC" "the issue completes after the wait, on its only cycle"
+  assert_contains "$OUT" "Usage limit reached" "the limit is detected at the end of the log"
+  assert_contains "$OUT" "no correction cycle is consumed" "the wait says it costs no cycle"
+  assert_eq "2" "$(impl_sessions)" "the same issue is re-run in a fresh session after the reset"
+  assert_eq "1" "$(prompt_files "$(state_dir)" 'cycle-')" "the re-run consumed no correction cycle: still a single implementation prompt"
+  assert_not_contains "$OUT" "Correction cycle" "no correction cycle was entered"
+}
+
+# ---------------------------------------------------------------------------
+# Cases — commits, session hygiene and exit codes (T18/T17: RF-09, RF-35, RF-34)
+# ---------------------------------------------------------------------------
+
+case_commit_one_per_approved_issue() {
+  standard_fixture commit-per-issue
+  reset_engine_counters
+  cp_before=$(head_rev)
+
+  run_loop
+  assert_eq "0" "$RC" "every issue approved: exit 0"
+  assert_eq "3" "$(new_commits_since "$cp_before")" "exactly one new commit per approved issue"
+  (cd "$FIX" && git log --format=%s "$cp_before..HEAD") > "$TMP/subjects.txt"
+  assert_contains "$TMP/subjects.txt" "feat(issue-1): [feat] Foundation" "the commit subject carries the issue number and its title"
+  assert_contains "$TMP/subjects.txt" "feat(issue-3): [feat] Third" "the last issue is committed under its own number"
+  (cd "$FIX" && git show --stat --format= HEAD) > "$TMP/last-commit.txt"
+  assert_contains "$TMP/last-commit.txt" "impl-slice-3.txt" "the commit covers the work of that issue"
+  assert_not_contains "$TMP/last-commit.txt" "impl-slice-1.txt" "and only of that issue"
+}
+
+# RF-35d: green gates with a clean work tree means the issue was already
+# implemented in HEAD. Done, no commit, and not a failure.
+case_already_implemented_issue_leaves_head_untouched() {
+  single_fixture already-implemented
+  echo "already implemented" > "$FIX/impl-slice-1.txt"
+  commit_fixture
+  reset_engine_counters
+  ai_before=$(head_rev)
+
+  MOCK_SCENARIO=noop run_loop
+  assert_eq "0" "$RC" "an issue already implemented in HEAD is not a failure"
+  assert_contains "$OUT" "ALREADY IMPLEMENTED in HEAD" "the outcome is named"
+  assert_eq "$ai_before" "$(head_rev)" "git rev-parse HEAD is identical to before the issue"
+  assert_matches "$(state_dir)/progress.tsv" "^1${TAB}[0-9a-f]{64}${TAB}done${TAB}" "the issue is still recorded done"
+}
+
+# RF-09: N issues plus M correction cycles produce exactly N+M implementation
+# sessions, each with its own prompt file, none reused. The verifier is itself
+# an engine session and is counted separately.
+case_sessions_are_never_reused() {
+  standard_fixture session-hygiene
+  reset_engine_counters
+
+  MOCK_SCENARIO=green-cycle-2 run_loop
+  assert_eq "0" "$RC" "three issues, one correction cycle each: exit 0"
+  assert_eq "6" "$(impl_sessions)" "N=3 issues plus M=3 correction cycles is 6 implementation sessions"
+  assert_eq "6" "$(prompt_files "$(state_dir)" 'cycle-')" "one implementation prompt file per session, none reused"
+  assert_eq "6" "$(verify_sessions)" "the verifier sessions are counted separately from those"
+  assert_eq "6" "$(prompt_files "$(state_dir)" 'verify-')" "and they have prompt files of their own"
+
+  # Self-contained: a correction prompt carries the whole issue, because the
+  # session that reads it has no memory of the one before it.
+  assert_contains "$(state_dir)/prompts/slice-02.cycle-2.txt" "## Slice 2:" "the correction prompt carries the whole issue"
+  assert_contains "$(state_dir)/prompts/slice-02.cycle-2.txt" "Discover the stack and the conventions" "and the stack-discovery preamble that assumes no language"
+  assert_not_contains "$(state_dir)/prompts/slice-02.cycle-2.txt" "## Slice 1:" "and nothing of another issue"
+}
+
+# RF-34e, the full matrix: `failed` and `unverified` are the only two causes of
+# a non-zero exit; `blocked` and `blocked-external` never are.
+case_exit_code_matrix() {
+  standard_fixture exit-matrix
+  reset_engine_counters
+  run_loop
+  assert_eq "0" "$RC" "all green: exit 0"
+  assert_contains "$OUT" "Run finished: every executed issue is recorded done." "the green run says so"
+
+  single_fixture exit-matrix-failed
+  reset_engine_counters
+  MOCK_SCENARIO=noop run_loop --max-cycles 1
+  assert_ne "0" "$RC" "some issue failed: non-zero"
+
+  single_fixture exit-matrix-unverified
+  reset_engine_counters
+  run_loop --no-verify
+  assert_ne "0" "$RC" "some issue unverified: non-zero"
+  assert_contains "$OUT" "recorded 'unverified'" "the report names the cause of the non-zero exit"
+
+  graph_fixture exit-matrix-external \
+    "1|Ready|nenhum|não publicada" \
+    "2|Waiting on the world|#999|não publicada"
+  reset_engine_counters
+  run_loop
+  assert_eq "0" "$RC" "blocked-external as the only anomaly: exit 0"
+  assert_contains "$OUT" "Externally blocked issues never change the exit code." "the report says the external block is not a failure"
+}
+
+# UI-04 / RF-34: the final report groups every issue by state and points at the
+# logs of each one.
+case_final_report_groups_by_state() {
+  graph_fixture report-groups \
+    "1|Ready|nenhum|não publicada" \
+    "2|Waiting on the world|#999|não publicada" \
+    "3|Behind the external block|Slice 2|não publicada"
+  reset_engine_counters
+
+  run_loop
+  assert_eq "0" "$RC" "the run exits 0"
+  assert_contains "$OUT" "FINAL REPORT" "the run ends in a report"
+  assert_matches "$OUT" "^done \(1\):" "the report groups the completed issues"
+  assert_matches "$OUT" "^blocked \(1\):" "and the blocked ones"
+  assert_matches "$OUT" "^blocked-external \(1\):" "and the externally blocked ones"
+  assert_contains "$OUT" "logs: .spec/features/demo/.loop/logs/slice-01.*" "each line points at the logs of its issue"
+}
+
+# RNF-07: no credential file is ever read, and nothing that looks like one is
+# ever written into a prompt or a log.
+case_loop_never_reads_a_credential_file() {
+  new_fixture no-dotenv
+  grep -nE '\.env|API_KEY|SECRET|TOKEN|PASSWORD' "$LOOP" | grep -vE '^[0-9]+:[[:space:]]*#' > "$OUT" 2>&1
+  assert_empty_file "$OUT" "loop.sh names a credential file or a secret variable nowhere but in the comment that forbids it"
 }
 
 # ---------------------------------------------------------------------------
@@ -1521,6 +1925,19 @@ case_graph_body_prose_heading_is_never_parsed
 case_graph_issue_number_blocker_matching_a_slice_is_an_edge
 case_graph_failure_propagates_transitively
 case_graph_prose_heading_is_not_a_parsing_source
+case_gate_engine_exit_zero_without_writing_fails_the_issue
+case_gate_red_suite_fails_then_the_correction_cycle_makes_one_commit
+case_gate_verifier_session_is_read_only
+case_gate_verifier_count_divergence_is_red
+case_gate_verifier_zero_parsed_lines_is_red
+case_gate_verifier_incomplete_then_done
+case_usage_limit_waits_and_reruns_the_same_issue
+case_commit_one_per_approved_issue
+case_already_implemented_issue_leaves_head_untouched
+case_sessions_are_never_reused
+case_exit_code_matrix
+case_final_report_groups_by_state
+case_loop_never_reads_a_credential_file
 "
 
 make_mocks

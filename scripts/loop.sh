@@ -39,8 +39,47 @@
 #   MS_LOOP_VERIFY           verifier gate: always (default) | auto | off
 #   MS_LOOP_MAX_CYCLES       correction cycles per issue (default: 3)
 #   MS_LOOP_MAX_LIMIT_WAITS  consecutive usage-limit waits per issue (def: 20)
+#   MS_LOOP_VERIFY_MODEL     model of the verifier session (claude: haiku)
+#   MS_LOOP_LIMIT_WAIT_DEFAULT  usage-limit wait, in seconds, when the engine
+#                            announces no reset time (default: 1800)
+#   MS_LOOP_LIMIT_BUFFER     seconds added after an announced reset (def: 60)
 #   MS_LOOP_LABEL            triage label used when publishing issues
 #                            (default: ready-for-agent)
+#
+# Exported for the consumer project's own hooks, one value per issue:
+#   MS_LOOP_ISSUE_NUM  MS_LOOP_ISSUE_TITLE  MS_LOOP_ISSUE_TOTAL
+#   MS_LOOP_ISSUE_ATTEMPT  MS_LOOP_ENGINE  MS_LOOP_LABEL
+#   No secret, token or connection string is ever exported, written into a
+#   prompt or written into a log, and no .env file is ever read.
+#
+# Gates, in the order they run. The engine exit code is NEVER a verdict of
+# completion on any path:
+#   1. the engine session finished at all (is_error on claude, exit code on
+#      codex) — a signal about the run, never about the work
+#   2. the tree signature, a SIGNAL of "did this session write?" — an issue
+#      already implemented in HEAD correctly produces no write
+#   3. SUITE GATE — the resolved test command, run by the loop OUTSIDE the
+#      agent session with stdin redirected, its real output captured as the
+#      cause fed to the next correction cycle
+#   4. VERIFIER GATE — a fresh, read-only engine session judging the issue's
+#      `## Critérios de aceite` checkboxes one by one under CT-07: one
+#      `CRITERION <n>: DONE|INCOMPLETE — <evidence>` line per checkbox. Red
+#      when nothing parses, when the line count differs from the checkbox
+#      count (anti-gaming, red even when every line says DONE), or when any
+#      line is INCOMPLETE.
+#
+# Outcome of an issue, and the exit code of the run:
+#   every ACTIVE gate green            -> `done`, exactly one commit,
+#                                         `feat(issue-<N>): <title>`, created
+#                                         only AFTER the gates went green
+#   every active gate green, tree clean-> `done` with NO commit: the issue was
+#                                         already implemented in HEAD
+#   ZERO active gate                   -> still executed, still committed, but
+#                                         recorded `unverified`, never `done`
+#   correction cycles exhausted        -> `failed`, never a commit
+#   The run exits non-zero IF AND ONLY IF some issue ended `failed` or some
+#   issue ended `unverified`. `blocked`, `blocked-external` and a skipped
+#   publication never change the exit code.
 #
 # Input resolution — the first rule that resolves wins:
 #   1. the positional argument
@@ -1400,6 +1439,820 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# Prompts (T09, RF-09) — one self-contained file per session
+#
+# Every issue AND every correction cycle gets its OWN prompt file and its OWN
+# engine session: a session is never reused, so nothing carries over from
+# another issue or from another cycle. The prompt is therefore the only context
+# a session has, and it has to stand on its own.
+#
+# The preamble names no language, framework or runtime: it tells the session
+# where to LOOK for the project's conventions instead of assuming them.
+#
+# Nothing here ever reads .env or any credential file, and nothing here ever
+# copies an environment value into a prompt or a log (RNF-07).
+# ---------------------------------------------------------------------------
+
+slice_path() { printf '%s/%s' "$SLICES_DIR" "$(slice_file_name "$1")"; }
+slice_stem() { printf 'slice-%02d' "$1"; }
+
+impl_prompt_path()   { printf '%s/%s.cycle-%s.txt'  "$PROMPT_DIR" "$(slice_stem "$1")" "$2"; }
+verify_prompt_path() { printf '%s/%s.verify-%s.txt' "$PROMPT_DIR" "$(slice_stem "$1")" "$2"; }
+impl_log_path()      { printf '%s/%s.cycle-%s.log'  "$LOG_DIR" "$(slice_stem "$1")" "$2"; }
+verify_log_path()    { printf '%s/%s.verify-%s.log' "$LOG_DIR" "$(slice_stem "$1")" "$2"; }
+suite_log_path()     { printf '%s/%s.suite-%s.log'  "$LOG_DIR" "$(slice_stem "$1")" "$2"; }
+
+context_preamble() {
+  cat <<'PREAMBLE'
+## Discover the stack and the conventions before writing code
+This project may be written in ANY language or framework. Do NOT assume a
+stack. Before you start, READ whichever of these exist, in this order:
+1. AGENTS.md or CLAUDE.md — the project's conventions, commands and rules
+2. .spec/init/project-description.md — the general project description
+3. .spec/init/user-stories.md — the user stories
+4. .spec/init/database-schema.md — the user-facing data model
+5. the documents the issue itself names (the feature's SPEC.md and PLAN.md)
+Use the build, test and run commands those documents and the tooling already
+present in the repository define. If the project has a memory or context tool
+configured, use it to understand the history.
+PREAMBLE
+
+  # The suite gate runs THIS command. A session that validates itself with a
+  # different runner sees green while the gate sees red, so the command the
+  # loop resolved is stated in the prompt.
+  if [ -n "$TEST_CMD" ]; then
+    echo
+    echo "## The test command of this project"
+    echo "Always run the suite with:"
+    echo
+    echo "    $TEST_CMD"
+    echo
+    echo "This is the exact command used to validate the issue. Do not use another"
+    echo "runner and do not run the tests outside it."
+  fi
+}
+
+# The implementation prompt of a fresh issue.
+build_impl_prompt() {
+  bip_num="$1"
+  bip_cycle="$2"
+  bip_file=$(impl_prompt_path "$bip_num" "$bip_cycle")
+
+  {
+    echo "You are a senior developer implementing one issue of this project."
+    echo
+    context_preamble
+    cat <<'TASK'
+
+## Your task now
+Implement the issue below COMPLETELY.
+
+For each acceptance criterion:
+1. Write the complete code (leave no TODO and no placeholder)
+2. Write the tests the criterion calls for, in the project's test framework
+3. Run the tests with the project's test command
+4. If a test fails, fix the code and run it again
+5. Only move to the next criterion once the tests pass
+
+## Mandatory rules
+- Always use the commands, the test runner and the tooling the project has
+  already adopted; never introduce a new stack or tool on your own
+- Tests and fixtures/factories must create every dependency they need
+- Class, file and method names must follow EXACTLY what the issue describes
+- Do not skip any checkbox of the acceptance criteria
+- At the end, make sure the project's whole test suite passes
+
+## Issue to implement
+TASK
+    cat "$(slice_path "$bip_num")"
+  } > "$bip_file"
+
+  printf '%s' "$bip_file"
+}
+
+# The correction prompt. Self-contained like the first one, and carrying the
+# REAL cause of the red gate — never a generic "the tests failed", which tells
+# a fresh session nothing it can act on.
+build_fix_prompt() {
+  bfp_num="$1"
+  bfp_cycle="$2"
+  bfp_gate="$3"
+  bfp_cause="$4"
+  bfp_file=$(impl_prompt_path "$bfp_num" "$bfp_cycle")
+
+  {
+    echo "You are a senior developer finishing a partially implemented issue."
+    echo
+    context_preamble
+    cat <<'INTRO'
+
+## Situation
+An earlier session tried to implement the issue below and did NOT pass the
+mechanical verification. You are in a NEW session: you have no memory of what
+was done. Read the current code before changing anything.
+
+## Mandatory rules
+- Fix ONLY what is missing. Do not reimplement what is already correct and tested.
+- Leave no TODO, no placeholder and no skipped test.
+- Run the project's test suite at the end and make sure it passes.
+INTRO
+    echo
+    echo "## Why the previous session was rejected ($bfp_gate)"
+    echo '```'
+    printf '%s\n' "$bfp_cause"
+    echo '```'
+    echo
+    echo "## Issue to complete"
+    cat "$(slice_path "$bfp_num")"
+  } > "$bfp_file"
+
+  printf '%s' "$bfp_file"
+}
+
+# The checkbox lines of the issue body's `## Critérios de aceite` section —
+# the PT-BR heading is the literal of CT-02 and is what the verifier judges,
+# one line of verdict per checkbox (CT-07).
+criteria_checkboxes() {
+  awk '
+    /^##[[:space:]]+Critérios de aceite[[:space:]]*$/ { inside = 1; next }
+    /^##[[:space:]]/ { inside = 0 }
+    inside && /^[[:space:]]*- \[[ xX]\]/ { print }
+  ' "$1"
+}
+
+# The verifier prompt embeds the checkboxes it must judge and the CT-07 verdict
+# protocol verbatim. The same literals are duplicated in the verifier agent
+# specification on purpose (each file must stand alone at runtime) and the
+# drift check is what keeps the two copies identical.
+build_verify_prompt() {
+  bvp_num="$1"
+  bvp_cycle="$2"
+  bvp_file=$(verify_prompt_path "$bvp_num" "$bvp_cycle")
+
+  {
+    cat <<'VERIFY'
+You are an INDEPENDENT VERIFIER. Do NOT write, edit or create any file. Your
+only job is to read the real code and say what is done and what is not.
+
+For EACH checkbox of the issue's `## Critérios de aceite` section, in the order
+they appear, check the criterion against the real code — files, classes, tests,
+routes, migrations, whatever the criterion demands — and emit EXACTLY ONE line
+per checkbox, in this format:
+
+CRITERION <n>: DONE|INCOMPLETE — <arquivo:linha ou saída real de comando>
+
+Rules:
+- <n> is the index of the checkbox, starting at 1.
+- One CRITERION line per checkbox, no exception, never grouped.
+- Emit no other text besides the CRITERION lines.
+- The evidence is either `file:line` or the REAL output of a command you ran.
+  "Not verifiable" does not exist: no evidence means the criterion is not met.
+- Missing code, a TODO, a placeholder or a missing test means INCOMPLETE.
+- When in doubt, INCOMPLETE.
+
+## Checkboxes to judge
+VERIFY
+    criteria_checkboxes "$(slice_path "$bvp_num")"
+    echo
+    echo "## Issue under verification"
+    cat "$(slice_path "$bvp_num")"
+  } > "$bvp_file"
+
+  printf '%s' "$bvp_file"
+}
+
+# ---------------------------------------------------------------------------
+# Usage limit (RNF-06) — looked for at the END of the log, with per-engine
+# patterns. Scanning the whole log would make a project's own test output
+# ("429", "too many requests") trigger a half-hour sleep.
+# ---------------------------------------------------------------------------
+
+LIMIT_WAITS=0
+LIMIT_WAIT_DEFAULT="${MS_LOOP_LIMIT_WAIT_DEFAULT:-1800}"
+LIMIT_BUFFER="${MS_LOOP_LIMIT_BUFFER:-60}"
+
+# Echoes the reset epoch when it finds one, `0` for a limit without a time.
+# Returns 0 when a usage limit was detected, 1 when there is none.
+detect_usage_limit() {
+  dul_tail=$(tail -n 20 "$1" 2> /dev/null || true)
+
+  if [ "$ENGINE" = "claude" ]; then
+    dul_pattern='usage limit reached'
+  else
+    dul_pattern='rate limit reached|quota exceeded|usage limit reached'
+  fi
+
+  printf '%s\n' "$dul_tail" | grep -qiE "$dul_pattern" || return 1
+
+  dul_epoch=$(printf '%s\n' "$dul_tail" | grep -oiE 'usage limit reached[^0-9]*[0-9]{10,13}' \
+    | grep -oE '[0-9]{10,13}' | tail -1 || true)
+  if [ -z "$dul_epoch" ]; then
+    dul_epoch=$(printf '%s\n' "$dul_tail" | grep -oiE 'reset[a-z ]*[0-9]{10,13}' \
+      | grep -oE '[0-9]{10,13}' | tail -1 || true)
+  fi
+
+  printf '%s' "${dul_epoch:-0}"
+  return 0
+}
+
+# Waits for the reset and returns, so the caller re-runs the SAME issue on the
+# SAME cycle: a usage limit is not a failed attempt and never consumes a
+# correction cycle. The number of consecutive waits is capped so a permanently
+# limited account ends the run instead of sleeping forever.
+wait_for_reset() {
+  wfr_epoch="$1"
+  wfr_now=$(date +%s)
+
+  LIMIT_WAITS=$((LIMIT_WAITS + 1))
+  if [ "$LIMIT_WAITS" -gt "$MAX_LIMIT_WAITS" ]; then
+    fail "Usage limit hit $LIMIT_WAITS times in a row on this issue (cap: $MAX_LIMIT_WAITS)."
+    fail "Aborting instead of sleeping indefinitely."
+    exit 1
+  fi
+
+  case "$wfr_epoch" in
+    '' | *[!0-9]*) wfr_epoch=0 ;;
+  esac
+  if [ "$wfr_epoch" -gt 0 ]; then
+    if [ "${#wfr_epoch}" -ge 13 ]; then
+      wfr_epoch=$((wfr_epoch / 1000))
+    fi
+    wfr_secs=$((wfr_epoch - wfr_now + LIMIT_BUFFER))
+    [ "$wfr_secs" -lt "$LIMIT_BUFFER" ] && wfr_secs=$LIMIT_BUFFER
+    warn "Usage limit reached. Reset announced by the engine; waiting for it."
+  else
+    wfr_secs=$LIMIT_WAIT_DEFAULT
+    warn "Usage limit reached. No reset time in the output; waiting the fallback interval."
+  fi
+
+  warn "Wait $LIMIT_WAITS/$MAX_LIMIT_WAITS — sleeping $(format_duration "$wfr_secs") before re-running the SAME issue (no correction cycle is consumed)."
+
+  wfr_left=$wfr_secs
+  while [ "$wfr_left" -gt 0 ]; do
+    wfr_chunk=60
+    [ "$wfr_left" -lt 60 ] && wfr_chunk=$wfr_left
+    sleep "$wfr_chunk"
+    wfr_left=$((wfr_left - wfr_chunk))
+    [ "$wfr_left" -gt 0 ] && log "Resuming in $(format_duration "$wfr_left")..."
+  done
+
+  success "Reset window elapsed. Re-running the same issue."
+}
+
+# ---------------------------------------------------------------------------
+# Engine (T09)
+#
+# Every invocation has its stdin REDIRECTED, never inherited: the prompt file
+# for one engine, /dev/null for the other. A body command that reads stdin when
+# it is not a TTY would otherwise swallow the loop's own stream, and the run
+# would silently stop after the first issue. The manifest is read over fd 3 for
+# the same reason (UI-05: the loop asks nothing and blocks on nothing).
+# ---------------------------------------------------------------------------
+
+VERIFY_MODEL="${MS_LOOP_VERIFY_MODEL:-}"
+
+resolve_verify_model() {
+  [ -z "$VERIFY_MODEL" ] || return 0
+  # A read-only verdict is cheap work; the expensive model buys nothing here.
+  [ "$ENGINE" = "claude" ] && VERIFY_MODEL="haiku"
+  return 0
+}
+
+# run_engine <prompt file> <log file> <impl|verify>
+run_engine() {
+  re_prompt="$1"
+  re_log="$2"
+  re_mode="$3"
+
+  export MS_LOOP_ENGINE="$ENGINE"
+  export MS_LOOP_MAX_CYCLES="$MAX_CYCLES"
+
+  while true; do
+    re_rc=0
+
+    if [ "$ENGINE" = "codex" ]; then
+      if [ "$re_mode" = "verify" ]; then
+        if [ -n "$VERIFY_MODEL" ]; then
+          codex exec --sandbox read-only --model "$VERIFY_MODEL" - \
+            < "$re_prompt" > "$re_log" 2>&1 || re_rc=$?
+        else
+          codex exec --sandbox read-only - < "$re_prompt" > "$re_log" 2>&1 || re_rc=$?
+        fi
+      else
+        codex exec --sandbox danger-full-access - < "$re_prompt" > "$re_log" 2>&1 || re_rc=$?
+      fi
+    else
+      if [ "$re_mode" = "verify" ]; then
+        if [ -n "$VERIFY_MODEL" ]; then
+          env -u CLAUDECODE claude --dangerously-skip-permissions \
+            --model "$VERIFY_MODEL" \
+            -p "$(cat "$re_prompt")" \
+            --allowedTools "Read,Glob,Grep" \
+            --output-format text < /dev/null > "$re_log" 2>&1 || re_rc=$?
+        else
+          env -u CLAUDECODE claude --dangerously-skip-permissions \
+            -p "$(cat "$re_prompt")" \
+            --allowedTools "Read,Glob,Grep" \
+            --output-format text < /dev/null > "$re_log" 2>&1 || re_rc=$?
+        fi
+      else
+        # JSON output: the CLI exit code is a weak signal here, and the
+        # engine-finished gate reads is_error out of this stream.
+        env -u CLAUDECODE claude --dangerously-skip-permissions \
+          -p "$(cat "$re_prompt")" \
+          --output-format json < /dev/null > "$re_log" 2>&1 || re_rc=$?
+      fi
+    fi
+
+    if re_epoch=$(detect_usage_limit "$re_log"); then
+      wait_for_reset "$re_epoch"
+      continue
+    fi
+
+    return "$re_rc"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Gates (T10, RF-10)
+#
+# The engine exit code is NEVER a verdict of completion, on any path: it only
+# tells whether the session ended at all. What decides an issue is the set of
+# ACTIVE mechanical gates — the project's own suite, run by the loop outside
+# the agent session, and an independent read-only verifier session judging the
+# acceptance criteria one by one under the CT-07 protocol.
+# ---------------------------------------------------------------------------
+
+GATE_CAUSE=""
+LAST_GATE=""
+SUITE_RESULT="disabled"
+VERIFY_RESULT="disabled"
+
+# Did the session end at all? A signal about the RUN, never about the work.
+gate_engine_finished() {
+  gef_log="$1"
+  gef_rc="$2"
+
+  if [ "$ENGINE" = "claude" ]; then
+    if ! grep -qF '"type":"result"' "$gef_log" && ! grep -qF '"type": "result"' "$gef_log"; then
+      GATE_CAUSE="The engine session ended without emitting a result. Tail of its output:
+$(tail -n 40 "$gef_log")"
+      return 1
+    fi
+    if grep -qE '"is_error"[[:space:]]*:[[:space:]]*true' "$gef_log"; then
+      GATE_CAUSE="The engine reported is_error=true. Tail of its output:
+$(tail -n 40 "$gef_log")"
+      return 1
+    fi
+  fi
+
+  if [ "$gef_rc" -ne 0 ]; then
+    GATE_CAUSE="The engine exited with code $gef_rc. Tail of its output:
+$(tail -n 40 "$gef_log")"
+    return 1
+  fi
+
+  return 0
+}
+
+# A signature of the work tree: tracked changes plus the content of everything
+# untracked. Never mutates the index.
+tree_signature() {
+  ts_tmp="$STATE_DIR/.treesig.$$"
+  {
+    git status --porcelain 2> /dev/null || true
+    git diff HEAD 2> /dev/null || true
+    git ls-files --others --exclude-standard 2> /dev/null | while IFS= read -r ts_path; do
+      printf '%s\n' "$ts_path"
+      cat "$ts_path" 2> /dev/null || true
+    done
+  } > "$ts_tmp" 2> /dev/null || true
+  ts_hash=$(hash_file "$ts_tmp")
+  rm -f "$ts_tmp"
+  printf '%s' "$ts_hash"
+}
+
+# Did THIS session write anything? A SIGNAL, never a verdict: an issue already
+# implemented in HEAD makes a correct session write nothing at all, and failing
+# it here would be a false negative. Only the suite gate and the verifier gate
+# know whether the work is complete. The signal feeds the correction cause and
+# the `auto` mode of the verifier gate.
+session_wrote_something() {
+  [ "$(tree_signature)" != "$1" ]
+}
+
+# SUITE GATE — the consumer project's own suite, run BY THE LOOP, outside the
+# agent session, with stdin redirected, and its REAL output captured as the
+# cause handed to the next correction cycle.
+gate_suite() {
+  gs_log="$1"
+
+  if [ -z "$TEST_CMD" ]; then
+    SUITE_RESULT="disabled"
+    return 0
+  fi
+
+  log "Suite gate — running the project's suite: $TEST_CMD"
+  gs_rc=0
+  bash -c "$TEST_CMD" < /dev/null > "$gs_log" 2>&1 || gs_rc=$?
+
+  if [ "$gs_rc" -ne 0 ]; then
+    SUITE_RESULT="failed"
+    GATE_CAUSE="The project's test command ('$TEST_CMD') failed with code $gs_rc. Real output:
+$(tail -n 200 "$gs_log")"
+    return 1
+  fi
+
+  SUITE_RESULT="passed"
+  success "Suite gate — green"
+  return 0
+}
+
+# VERIFIER GATE — a FRESH, READ-ONLY engine session judging the issue's
+# acceptance criteria one by one, under the CT-07 protocol. Its report is
+# consumed by the loop and grows with the number of criteria; the 200-byte
+# handoff ceiling applies to router summaries, not to this.
+gate_verifier() {
+  gv_num="$1"
+  gv_cycle="$2"
+  gv_wrote="$3"
+  gv_log=$(verify_log_path "$gv_num" "$gv_cycle")
+
+  VERIFY_RESULT="disabled"
+
+  case "$VERIFY_MODE" in
+    off)
+      log "Verifier gate disabled (--no-verify / MS_LOOP_VERIFY=off)"
+      return 0
+      ;;
+    auto)
+      if [ "$gv_cycle" -eq 1 ] && [ "$gv_wrote" = true ] && [ -n "$TEST_CMD" ]; then
+        log "Verifier gate skipped: the session wrote code and the suite gate is green (MS_LOOP_VERIFY=always to run it every time)"
+        return 0
+      fi
+      ;;
+  esac
+
+  gv_expected=$(criteria_checkboxes "$(slice_path "$gv_num")" | grep -c '' | tr -d ' ')
+  if [ "$gv_expected" -eq 0 ]; then
+    warn "Verifier gate disabled for Slice $gv_num: its body declares no '## Critérios de aceite' checkbox to judge."
+    return 0
+  fi
+
+  log "Verifier gate — independent read-only session ($gv_expected criteria${VERIFY_MODEL:+, model: $VERIFY_MODEL})"
+  gv_prompt=$(build_verify_prompt "$gv_num" "$gv_cycle")
+  run_engine "$gv_prompt" "$gv_log" verify || true
+
+  gv_lines=$(sed 's/^[[:space:]]*//' "$gv_log" | grep -E '^CRITERION [0-9]+: (DONE|INCOMPLETE)' || true)
+  gv_parsed=$(printf '%s' "$gv_lines" | grep -c '' | tr -d ' ')
+  [ -n "$gv_lines" ] || gv_parsed=0
+
+  if [ "$gv_parsed" -eq 0 ]; then
+    VERIFY_RESULT="failed"
+    GATE_CAUSE="The independent verifier emitted no 'CRITERION <n>: DONE|INCOMPLETE' line at all, so nothing confirms the issue is complete. Tail of the verifier output:
+$(tail -n 40 "$gv_log")"
+    return 1
+  fi
+
+  # Anti-gaming: a verdict that does not cover exactly one line per checkbox is
+  # RED even when every line it did emit says DONE. A prolix or a truncated
+  # verifier must never be able to approve an incomplete issue.
+  if [ "$gv_parsed" -ne "$gv_expected" ]; then
+    VERIFY_RESULT="failed"
+    GATE_CAUSE="The verifier emitted $gv_parsed verdict line(s) for $gv_expected acceptance criteria — the coverage does not match, so the verdict is rejected. Lines emitted:
+$gv_lines"
+    return 1
+  fi
+
+  gv_incomplete=$(printf '%s\n' "$gv_lines" | grep 'INCOMPLETE' || true)
+  if [ -n "$gv_incomplete" ]; then
+    VERIFY_RESULT="failed"
+    GATE_CAUSE="The independent verifier found unmet acceptance criteria:
+$gv_incomplete"
+    return 1
+  fi
+
+  VERIFY_RESULT="passed"
+  success "Verifier gate — $gv_parsed/$gv_expected criteria confirmed in the real code"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Issue execution (T11, RF-34 a, RF-35 c/d/e)
+#
+# One issue end to end: a fresh implementation session, the gates, up to
+# --max-cycles correction cycles fed by the REAL red cause, then the outcome.
+# The commit is created ONLY after every active gate is green, never before,
+# and `failed` and `blocked` never produce one.
+# ---------------------------------------------------------------------------
+
+commit_slice() {
+  cs_num="$1"
+  cs_title="$2"
+  git add -A
+  if git diff --cached --quiet; then
+    fail "Nothing to commit after the gates went green — unexpected state."
+    return 1
+  fi
+  git commit -q -m "feat(issue-${cs_num}): ${cs_title}"
+  log "Commit created: feat(issue-${cs_num}): ${cs_title}"
+  return 0
+}
+
+# run_slice <number> <title> <hash> <seq> <total>
+# Records the outcome in the progress record, which is the single place the
+# report and the exit code read it from. Returns 0 for done/unverified, 1 for
+# failed.
+run_slice() {
+  rs_num="$1"
+  rs_title="$2"
+  rs_hash="$3"
+  rs_seq="$4"
+  rs_total="$5"
+  rs_started=$(date +%s)
+
+  # Per-issue context for the consumer project's own hooks. No secret, token
+  # or connection string is ever exported, written to a prompt or logged.
+  export MS_LOOP_ISSUE_NUM="$rs_num"
+  export MS_LOOP_ISSUE_TITLE="$rs_title"
+  export MS_LOOP_ISSUE_TOTAL="$rs_total"
+
+  LIMIT_WAITS=0
+  GATE_CAUSE=""
+  LAST_GATE=""
+
+  echo ""
+  log "[$rs_seq/$rs_total] Slice $rs_num: $rs_title"
+
+  rs_cycle=1
+  while [ "$rs_cycle" -le "$MAX_CYCLES" ]; do
+    export MS_LOOP_ISSUE_ATTEMPT="$rs_cycle"
+    [ "$rs_cycle" -gt 1 ] && warn "Correction cycle $rs_cycle/$MAX_CYCLES..."
+
+    rs_log=$(impl_log_path "$rs_num" "$rs_cycle")
+    if [ "$rs_cycle" -eq 1 ]; then
+      rs_prompt=$(build_impl_prompt "$rs_num" "$rs_cycle")
+    else
+      rs_prompt=$(build_fix_prompt "$rs_num" "$rs_cycle" "$LAST_GATE" "$GATE_CAUSE")
+    fi
+
+    rs_sig_before=$(tree_signature)
+    rs_rc=0
+    run_engine "$rs_prompt" "$rs_log" impl || rs_rc=$?
+
+    GATE_CAUSE=""
+    SUITE_RESULT="disabled"
+    VERIFY_RESULT="disabled"
+
+    rs_wrote=true
+    rs_note=""
+    if ! session_wrote_something "$rs_sig_before"; then
+      rs_wrote=false
+      rs_note="The previous session ended without changing a single file. "
+      warn "The session wrote nothing; validating the code that is already there"
+    fi
+
+    if ! gate_engine_finished "$rs_log" "$rs_rc"; then
+      LAST_GATE="engine session did not finish"
+      fail "Engine session gate red"
+    elif ! gate_suite "$(suite_log_path "$rs_num" "$rs_cycle")"; then
+      LAST_GATE="suite gate — the project's test command"
+      GATE_CAUSE="${rs_note}${GATE_CAUSE}"
+      fail "Suite gate red — the project's tests failed"
+    elif ! gate_verifier "$rs_num" "$rs_cycle" "$rs_wrote"; then
+      LAST_GATE="verifier gate — independent verification"
+      GATE_CAUSE="${rs_note}${GATE_CAUSE}"
+      fail "Verifier gate red — the issue is not complete"
+    else
+      finish_green_slice "$rs_num" "$rs_title" "$rs_hash" "$rs_started"
+      return 0
+    fi
+
+    rs_cycle=$((rs_cycle + 1))
+  done
+
+  progress_put "$rs_num" "$rs_hash" "failed" "$SUITE_RESULT" "$VERIFY_RESULT" \
+    "$LAST_GATE: $(printf '%s' "$GATE_CAUSE" | head -n 3)"
+
+  fail "Slice $rs_num: $rs_title — FAILED after $MAX_CYCLES cycle(s) ($(format_duration "$(($(date +%s) - rs_started))"))"
+  fail "Last cause ($LAST_GATE):"
+  printf '%s\n' "$GATE_CAUSE" | head -n 20 | sed 's/^/    /' >&2
+  fail "Logs: $LOG_DIR/$(slice_stem "$rs_num").*"
+  if [ -n "$(git status --porcelain)" ]; then
+    warn "A failed issue never produces a commit, so its partial work is still in the work tree."
+    warn "Commit it (the loop re-validates the issue and moves on) or 'git checkout -- . && git clean -fd' to drop it."
+  fi
+  return 1
+}
+
+# Every active gate is green. What is left to decide is whether there is work
+# to commit and whether ANY gate was actually active.
+finish_green_slice() {
+  fgs_num="$1"
+  fgs_title="$2"
+  fgs_hash="$3"
+  fgs_started="$4"
+
+  fgs_active=0
+  [ "$SUITE_RESULT" = "disabled" ]  || fgs_active=$((fgs_active + 1))
+  [ "$VERIFY_RESULT" = "disabled" ] || fgs_active=$((fgs_active + 1))
+
+  fgs_state="done"
+  fgs_cause=""
+  if [ "$fgs_active" -eq 0 ]; then
+    # RF-10, zero-gates clause: the work is executed and committed, but nothing
+    # in this run could tell a finished issue from an unfinished one, so it is
+    # NEVER declared done. Absence of validation never yields a silent success.
+    fgs_state="unverified"
+    fgs_cause="no mechanical gate was active: the suite gate and the verifier gate are both disabled"
+    warn "Slice $fgs_num: $fgs_title — UNVERIFIED (no active gate); the run will exit non-zero"
+  fi
+
+  if [ -z "$(git status --porcelain)" ]; then
+    # Gates green and nothing to commit: the issue was already implemented in
+    # HEAD (an earlier committed run, code written by hand). Not a failure.
+    if [ "$fgs_state" = "done" ]; then
+      success "Slice $fgs_num: $fgs_title — ALREADY IMPLEMENTED in HEAD (nothing to commit)"
+      log "The active gates are green against the code in HEAD; no commit created."
+    fi
+    progress_put "$fgs_num" "$fgs_hash" "$fgs_state" "$SUITE_RESULT" "$VERIFY_RESULT" "$fgs_cause"
+    return 0
+  fi
+
+  # The commit happens HERE and nowhere else: after the gates, never before.
+  if ! commit_slice "$fgs_num" "$fgs_title"; then
+    progress_put "$fgs_num" "$fgs_hash" "failed" "$SUITE_RESULT" "$VERIFY_RESULT" "the commit could not be created"
+    return 1
+  fi
+
+  progress_put "$fgs_num" "$fgs_hash" "$fgs_state" "$SUITE_RESULT" "$VERIFY_RESULT" "$fgs_cause"
+  [ "$fgs_state" = "done" ] && success "Slice $fgs_num: $fgs_title — COMPLETE ($(format_duration "$(($(date +%s) - fgs_started))"))"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Selection loop (T12, RF-34 c)
+#
+# The manifest is read over fd 3, in topological order: an engine session or a
+# suite command that reads stdin cannot swallow the rest of the queue.
+# ---------------------------------------------------------------------------
+
+ordered_manifest_entries() {
+  for ome_want in $TOPO_ORDER; do
+    # shellcheck disable=SC2034  # every field must be named to be skipped
+    while IFS='|' read -r ome_file ome_num ome_title ome_hash ome_braw; do
+      [ -n "$ome_num" ] || continue
+      [ "$ome_num" = "$ome_want" ] || continue
+      printf '%s|%s|%s|%s|%s\n' "$ome_file" "$ome_num" "$ome_title" "$ome_hash" "$ome_braw"
+    done <<EOF
+$(manifest_entries)
+EOF
+  done
+}
+
+blockers_all_done() {
+  for bad_dep in $(slice_blockers "$1"); do
+    progress_is_done "$bad_dep" "$(manifest_hash_for "$bad_dep")" || return 1
+  done
+  return 0
+}
+
+execute_run() {
+  er_seq=0
+  er_ran=0
+
+  # shellcheck disable=SC2034  # every field must be named to be skipped
+  while IFS='|' read -r -u 3 er_file er_num er_title er_hash er_braw; do
+    [ -n "$er_num" ] || continue
+    er_seq=$((er_seq + 1))
+
+    if [ -n "$ONLY_SLICE" ] && [ "$ONLY_SLICE" != "$er_num" ]; then
+      continue
+    fi
+
+    # Only `done` is skipped from the record (RF-12). A recorded `blocked` or
+    # `blocked-external` from an EARLIER run never skips anything: both are
+    # recomputed for this run from the document itself, and RF-34d says they
+    # are always re-executed.
+    if progress_is_done "$er_num" "$er_hash"; then
+      log "Skipping Slice $er_num: $er_title (already recorded done)"
+      continue
+    fi
+
+    if in_list "$er_num" "$EXTERNALLY_BLOCKED" || in_list "$er_num" "$BLOCKED_SLICES"; then
+      log "Skipping Slice $er_num: $er_title ($(progress_state "$er_num" "$er_hash") — $(progress_cause "$er_num" "$er_hash"))"
+      continue
+    fi
+
+    if [ -z "$ONLY_SLICE" ] && ! blockers_all_done "$er_num"; then
+      progress_put "$er_num" "$er_hash" "blocked" "disabled" "disabled" \
+        "blocked by an unfinished blocker among: $(slice_field "$er_num" 5)"
+      warn "Skipping Slice $er_num: $er_title (a blocker is not recorded done)"
+      continue
+    fi
+
+    er_ran=$((er_ran + 1))
+    if run_slice "$er_num" "$er_title" "$er_hash" "$er_seq" "$SLICE_COUNT"; then
+      continue
+    fi
+
+    # RF-34 b: from here nothing downstream can ever have its blockers recorded
+    # done, so the whole cone goes down with it, transitively and with zero
+    # engine sessions.
+    er_cone=$(mark_dependents_of_failure "$er_num")
+    if [ -n "$er_cone" ]; then
+      warn "Blocked by the failure of Slice $er_num (no engine session for any of them): $er_cone"
+      for er_dep in $er_cone; do
+        in_list "$er_dep" "$BLOCKED_SLICES" || BLOCKED_SLICES="$BLOCKED_SLICES $er_dep"
+      done
+    fi
+
+    if [ "$KEEP_GOING" = true ]; then
+      warn "--keep-going: moving on to the other branches of the graph"
+    else
+      warn "Stopping at the first failed issue (use --keep-going to carry on)"
+      break
+    fi
+  done 3< <(ordered_manifest_entries)
+
+  log "$er_ran issue(s) executed in this run"
+}
+
+# ---------------------------------------------------------------------------
+# Final report and exit code (T12, RF-34 e)
+#
+# Non-zero if and only if some issue ended `failed` OR some issue ended
+# `unverified`. `blocked`, `blocked-external` and a skipped publication never
+# change it.
+# ---------------------------------------------------------------------------
+
+REPORT_FAILED=0
+REPORT_UNVERIFIED=0
+
+report_group() {
+  rg_label="$1"
+  rg_items="$2"
+  rg_colour="$3"
+  [ -n "$rg_items" ] || return 0
+  rg_count=$(printf '%s\n' "$rg_items" | sed '/^$/d' | grep -c '' | tr -d ' ')
+  echo ""
+  printf '%b%s (%s):%b\n' "$rg_colour" "$rg_label" "$rg_count" "$NC"
+  printf '%s\n' "$rg_items" | sed '/^$/d; s/^/    /'
+}
+
+final_report() {
+  fr_done=""; fr_unverified=""; fr_failed=""; fr_blocked=""; fr_external=""; fr_untouched=""
+  REPORT_FAILED=0
+  REPORT_UNVERIFIED=0
+
+  # shellcheck disable=SC2034  # every field must be named to be skipped
+  while IFS='|' read -r fr_file fr_num fr_title fr_hash fr_braw; do
+    [ -n "$fr_num" ] || continue
+    fr_state=$(progress_state "$fr_num" "$fr_hash")
+    fr_line="Slice $fr_num — $fr_title  (logs: $LOG_DIR/$(slice_stem "$fr_num").*)"
+    case "$fr_state" in
+      done)       fr_done="$fr_done$fr_line
+" ;;
+      unverified) fr_unverified="$fr_unverified$fr_line
+"; REPORT_UNVERIFIED=$((REPORT_UNVERIFIED + 1)) ;;
+      failed)     fr_failed="$fr_failed$fr_line
+"; REPORT_FAILED=$((REPORT_FAILED + 1)) ;;
+      blocked)    fr_blocked="$fr_blocked$fr_line
+" ;;
+      blocked-external) fr_external="$fr_external$fr_line
+" ;;
+      *)          fr_untouched="$fr_untouched$fr_line
+" ;;
+    esac
+  done <<EOF
+$(manifest_entries)
+EOF
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  log "FINAL REPORT (engine: $ENGINE, input: $INPUT_FILE)"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+  report_group "done" "$fr_done" "$GREEN"
+  report_group "unverified" "$fr_unverified" "$YELLOW"
+  report_group "failed" "$fr_failed" "$RED"
+  report_group "blocked" "$fr_blocked" "$YELLOW"
+  report_group "blocked-external" "$fr_external" "$YELLOW"
+  report_group "not reached" "$fr_untouched" "$BLUE"
+
+  echo ""
+  if [ "$REPORT_UNVERIFIED" -gt 0 ]; then
+    warn "$REPORT_UNVERIFIED issue(s) recorded 'unverified': executed with no active mechanical gate, so never declared done."
+  fi
+  if [ "$REPORT_FAILED" -gt 0 ]; then
+    fail "$REPORT_FAILED issue(s) recorded 'failed'."
+  fi
+  if [ -n "$fr_external" ]; then
+    log "Externally blocked issues never change the exit code."
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Preflight
 # ---------------------------------------------------------------------------
 
@@ -1448,11 +2301,22 @@ main() {
   split_slices
   validate_only_slice
   resolve_test_command
+  resolve_verify_model
   warn_when_no_mechanical_validation
   print_run_plan
 
+  execute_run
+  final_report
+
   m_elapsed=$(($(date +%s) - m_started))
-  success "Preflight and split complete in $(format_duration "$m_elapsed")"
+  log "Total time: $(format_duration "$m_elapsed")"
+
+  if [ "$REPORT_FAILED" -gt 0 ] || [ "$REPORT_UNVERIFIED" -gt 0 ]; then
+    fail "Run finished with $REPORT_FAILED failed and $REPORT_UNVERIFIED unverified issue(s)."
+    exit 1
+  fi
+
+  success "Run finished: every executed issue is recorded done."
 }
 
 main
