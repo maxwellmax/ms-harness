@@ -1241,6 +1241,17 @@ case_testcmd_loop_names_no_stack() {
 
   grep -niE '(^|[^[:alnum:]_-])sail([^[:alnum:]_-]|$)' "$LOOP" > "$OUT" 2>&1
   assert_empty_file "$OUT" "loop.sh contains no occurrence of 'sail' in any case (RF-13)"
+
+  # The teeth of "no `elif` naming a language or a framework outside the data
+  # rows": every manifest and package-manager name the harness knows lives in
+  # the table, so none of them may appear in the script that reads it.
+  grep -nE 'composer|package\.json|pytest|pyproject|go\.mod|Cargo\.toml|npm|cargo' "$LOOP" > "$OUT" 2>&1
+  assert_empty_file "$OUT" "no manifest or package-manager name from the table appears in loop.sh at all"
+
+  # And the table really is where they live, so the assertion above is not
+  # vacuously true because the harness forgot the data.
+  grep -cE '^[^#]' "$(dirname "$LOOP")/test-commands.conf" > "$OUT" 2>&1
+  assert_ne "0" "$(cat "$OUT")" "the fallback table carries the data rows loop.sh refuses to name"
 }
 
 # ---------------------------------------------------------------------------
@@ -1407,6 +1418,52 @@ case_graph_issue_number_blocker_matching_a_slice_is_an_edge() {
   assert_zero_engine_calls "issue-number edge"
 }
 
+# RF-34a/b with a `failed` root. The run loop that ends a slice `failed` is a
+# later task, so the entry point it will call is driven here on a patched copy
+# of the script — the harness's sanctioned way of reaching a path main() does
+# not reach yet. What is asserted is the propagation itself: the whole cone
+# downstream of the failure, at any depth, recorded `blocked` with the failure
+# named as the cause, an independent branch untouched, and no engine session
+# for any of them.
+case_graph_failure_propagates_transitively() {
+  graph_fixture graph-failed-root \
+    "1|A, the one that fails|nenhum|não publicada" \
+    "2|B, depends on A|Slice 1|não publicada" \
+    "3|C, depends on B|Slice 2|não publicada" \
+    "4|D, independent|nenhum|não publicada"
+  reset_engine_counters
+
+  gf_dir="$TMP/failed-root-scripts"
+  mkdir -p "$gf_dir"
+  sed 's/^  print_run_plan$/  print_run_plan\
+  mark_dependents_of_failure 1/' "$LOOP" > "$gf_dir/loop.sh"
+  chmod +x "$gf_dir/loop.sh"
+  cp "$(dirname "$LOOP")/test-commands.conf" "$gf_dir/test-commands.conf"
+  assert_ne "0" "$(grep -c 'mark_dependents_of_failure 1' "$gf_dir/loop.sh")" "the patched copy really drives the failure path"
+
+  gf_saved="$LOOP"
+  LOOP="$gf_dir/loop.sh"
+  run_loop
+  LOOP="$gf_saved"
+
+  assert_eq "0" "$RC" "marking the cone of a failed slice is not itself an error"
+  assert_matches "$(state_dir)/progress.tsv" "^2${TAB}[0-9a-f]{64}${TAB}blocked${TAB}disabled${TAB}disabled${TAB}blocked by Slice 1, which failed$" "the direct dependent of the failed slice is recorded blocked, cause named"
+  assert_matches "$(state_dir)/progress.tsv" "^3${TAB}[0-9a-f]{64}${TAB}blocked${TAB}disabled${TAB}disabled${TAB}blocked by Slice 1, which failed$" "the indirect dependent is recorded blocked transitively"
+  assert_eq "0" "$(grep -c "^4${TAB}" "$(state_dir)/progress.tsv")" "the independent branch is not touched by the failure"
+  assert_zero_engine_calls "failure propagation"
+}
+
+# RF-11 / CT-01, as a static assertion: `## Bloqueado por` may be named in the
+# prose of this script, but never read as a source of the graph.
+case_graph_prose_heading_is_not_a_parsing_source() {
+  new_fixture graph-prose-static
+  grep -n 'Bloqueado por' "$LOOP" | grep -vE '^[0-9]+:[[:space:]]*#' > "$OUT" 2>&1
+  assert_empty_file "$OUT" "'Bloqueado por' appears in loop.sh only inside comments, never as a parsing source"
+
+  grep -c '\*\*Blocked by\*\*' "$LOOP" > "$OUT" 2>&1
+  assert_ne "0" "$(cat "$OUT")" "the field that IS parsed is the one the contract names"
+}
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -1443,6 +1500,27 @@ case_progress_hash_is_per_slice
 case_only_slice_restricts_the_plan
 case_cli_surface_is_accepted
 case_env_max_cycles_is_read
+case_testcmd_flag_beats_environment
+case_testcmd_environment_beats_declarative_config
+case_testcmd_config_beats_fallback_table
+case_testcmd_table_beats_disabled_gate
+case_testcmd_one_fixture_per_supported_manifest
+case_testcmd_no_manifest_at_all_warns_and_runs
+case_testcmd_two_manifests_disable_the_gate
+case_testcmd_emptied_table_still_resolves_through_config
+case_testcmd_opening_line_names_the_applied_rule
+case_testcmd_zero_gates_warns_before_the_first_session
+case_testcmd_probe_inspects_the_invocation_directory_only
+case_testcmd_loop_names_no_stack
+case_graph_resolves_with_gh_absent_from_path
+case_graph_never_queries_github
+case_graph_blocker_not_done_is_never_selected
+case_graph_external_block_is_reported_and_never_selected
+case_graph_blocking_propagates_transitively
+case_graph_body_prose_heading_is_never_parsed
+case_graph_issue_number_blocker_matching_a_slice_is_an_edge
+case_graph_failure_propagates_transitively
+case_graph_prose_heading_is_not_a_parsing_source
 "
 
 make_mocks

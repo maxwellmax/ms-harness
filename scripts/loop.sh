@@ -1238,6 +1238,16 @@ mark_blocked_transitively() {
   printf '%s' "$(trim "$mbt_marked")"
 }
 
+# RF-34a/b: the run loop calls this the moment a slice ends `failed`. From that
+# moment nothing downstream of it can ever have its blockers recorded `done`,
+# so the whole cone goes down with it — transitively, and with zero engine
+# sessions for any of them. The failed slice itself is recorded by its own
+# outcome; this marks only what it took with it, and echoes the slice numbers
+# marked so the caller can report them.
+mark_dependents_of_failure() {
+  mark_blocked_transitively "$1" "blocked by Slice $1, which failed"
+}
+
 # The next slice to execute: the first one in topological order that still has
 # to run and whose every blocker is RECORDED `done`. That record is the only
 # readiness signal there is — RF-11 forbids asking GitHub, and the loop must
