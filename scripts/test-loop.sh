@@ -1810,13 +1810,31 @@ case_graph_failure_propagates_transitively() {
   assert_eq "1" "$(impl_sessions)" "the engine is invoked for the failed issue only"
   assert_contains "$OUT" "Stopping at the first failed issue" "the default behaviour is to stop at the first failure"
   assert_eq "0" "$(new_commits_since "$(cd "$FIX" && git rev-list --max-parents=0 HEAD)")" "neither the failed issue nor a blocked one produced a commit"
+}
 
-  # --keep-going carries on into the branch the failure does not reach.
+# RF-34c: stopping at the first failure is the default and `--keep-going` is
+# the opt-in that carries the run into the branches the failure does not reach.
+# The flag changes what still executes; it never changes the verdict.
+case_graph_keep_going_runs_an_independent_branch() {
+  graph_fixture graph-keep-going \
+    "1|A, the one that fails|nenhum|não publicada" \
+    "2|B, behind the failure|Slice 1|não publicada" \
+    "3|C, an independent branch|nenhum|não publicada"
+  reset_engine_counters
+
+  MOCK_SCENARIO=noop run_loop --max-cycles 1
+  assert_ne "0" "$RC" "the default run exits non-zero on the failure"
+  assert_contains "$OUT" "Stopping at the first failed issue (use --keep-going to carry on)" "the default names the flag that changes it"
+  assert_not_contains "$OUT" "Slice 3: [feat] C, an independent branch" "by default the independent branch is never reached"
+  assert_eq "1" "$(impl_sessions)" "one implementation session: the issue that failed"
+
   reset_engine_counters
   MOCK_SCENARIO=noop run_loop --max-cycles 1 --keep-going
-  assert_ne "0" "$RC" "--keep-going still exits non-zero when an issue failed"
+  assert_ne "0" "$RC" "--keep-going still exits non-zero, because an issue ended failed"
   assert_contains "$OUT" "--keep-going: moving on to the other branches of the graph" "the flag is what carries the run on"
-  assert_matches "$OUT" "Slice 4: \\[feat\\] D, independent" "an independent branch of the graph still executes after the failure"
+  assert_contains "$OUT" "Slice 3: [feat] C, an independent branch" "the independent branch executes after the failure"
+  assert_eq "2" "$(impl_sessions)" "the failed issue and the independent branch, and nothing else"
+  assert_matches "$(state_dir)/progress.tsv" "^2${TAB}[0-9a-f]{64}${TAB}blocked${TAB}" "what sits behind the failure stays blocked even with --keep-going"
 }
 
 # RF-11 / CT-01, as a static assertion: `## Bloqueado por` may be named in the
@@ -1914,6 +1932,7 @@ case_gate_verifier_count_divergence_is_red() {
   MOCK_SCENARIO=verify-short run_loop --max-cycles 1
   assert_ne "0" "$RC" "fewer verdict lines than checkboxes is red"
   assert_contains "$OUT" "emitted 1 verdict line(s) for 2 acceptance criteria" "the short verdict is named with both counts"
+  assert_not_contains "$OUT" "INCOMPLETE" "the short verdict said DONE on every line it emitted, and it is still red"
 }
 
 case_gate_verifier_zero_parsed_lines_is_red() {
@@ -1957,9 +1976,82 @@ case_usage_limit_waits_and_reruns_the_same_issue() {
   assert_not_contains "$OUT" "Correction cycle" "no correction cycle was entered"
 }
 
+# RF-20 with the zero-gates clause of RF-10, asserted as the three consequences
+# it is — the warning lands before any engine session, the issue is recorded
+# `unverified` and never `done`, and the run exits non-zero — plus the fourth
+# that follows from `unverified` not being `done`: the next run executes the
+# very same issue again, instead of skipping it as RF-12 would a `done` one.
+case_gate_zero_gates_records_unverified_and_reruns() {
+  single_fixture gate-zero-gates
+  reset_engine_counters
+
+  run_loop --no-verify
+  assert_ne "0" "$RC" "with the suite gate unresolved and the verifier off, the run exits non-zero"
+  assert_contains "$OUT" "NO MECHANICAL VALIDATION IS ACTIVE" "the zero-gates warning is printed"
+
+  zgr_warn=$(grep -n "NO MECHANICAL VALIDATION IS ACTIVE" "$OUT" | head -1 | cut -d: -f1)
+  zgr_session=$(grep -n "Slice 1: \[feat\] The only slice" "$OUT" | head -1 | cut -d: -f1)
+  assert_ne "" "$zgr_session" "the issue really was executed, so the ordering below compares two real lines"
+  assert_eq "1" "$([ "$zgr_warn" -lt "$zgr_session" ] && echo 1 || echo 0)" "the warning is printed before any engine invocation"
+
+  assert_matches "$(state_dir)/progress.tsv" "^1${TAB}[0-9a-f]{64}${TAB}unverified${TAB}disabled${TAB}disabled${TAB}" \
+    "the issue is recorded unverified, with both gate results recorded disabled"
+  assert_eq "0" "$(grep -c "${TAB}done${TAB}" "$(state_dir)/progress.tsv")" "no issue of a zero-gates run is recorded done"
+  assert_eq "1" "$(impl_sessions)" "the issue was executed all the same: zero gates never means zero work"
+
+  reset_engine_counters
+  run_loop --no-verify
+  assert_ne "0" "$RC" "the following run exits non-zero too, for the same reason"
+  assert_matches "$OUT" 'Slice 1 — unverified \(run\)' "the unverified issue is re-executed, never skipped"
+  assert_contains "$OUT" "1 slice(s) to execute, 0 skipped" "RF-12 skips only done, so nothing of a zero-gates run is skipped"
+  assert_eq "1" "$(impl_sessions)" "the re-execution is a fresh implementation session of its own"
+}
+
 # ---------------------------------------------------------------------------
 # Cases — commits, session hygiene and exit codes (T18/T17: RF-09, RF-35, RF-34)
 # ---------------------------------------------------------------------------
+
+# RF-12: resume, driven end to end rather than seeded. The first run records
+# every issue `done` by itself; the second reads that record, executes nothing
+# and exits 0.
+case_resume_two_consecutive_runs_are_idempotent() {
+  standard_fixture resume-idempotent
+  reset_engine_counters
+
+  run_loop
+  assert_eq "0" "$RC" "the first run completes"
+  assert_eq "3" "$(grep -c "${TAB}done${TAB}" "$(state_dir)/progress.tsv")" "the first run records all three issues done, with nothing seeded"
+  assert_eq "3" "$(impl_sessions)" "one implementation session per issue on the first run"
+
+  reset_engine_counters
+  run_loop
+  assert_eq "0" "$RC" "the second consecutive run over the all-done record: exit 0"
+  assert_contains "$OUT" "0 slice(s) to execute, 3 skipped" "every done issue is skipped"
+  assert_contains "$OUT" "Skipping Slice 1" "the skip is reported per issue"
+  assert_zero_engine_calls "second consecutive run over an all-done record"
+}
+
+# RF-27 / RNF-05: `gh` is optional to the loop, not merely tolerated. On a PATH
+# where it does not exist at all, the whole run — selection, gates, commits and
+# report — completes normally.
+case_run_completes_with_gh_absent() {
+  standard_fixture run-no-gh
+  make_gh_free_bin
+  reset_engine_counters
+  rg_before=$(head_rev)
+
+  RUN_PATH="$MOCK_BIN:$GH_FREE_BIN"
+  rg_gh=$(PATH="$RUN_PATH" command -v gh 2> /dev/null)
+  assert_eq "" "$rg_gh" "gh really is absent from the PATH the run uses"
+
+  run_loop
+  RUN_PATH=""
+  assert_eq "0" "$RC" "a run with gh absent from PATH completes normally"
+  assert_eq "3" "$(grep -c "${TAB}done${TAB}" "$(state_dir)/progress.tsv")" "every issue is recorded done"
+  assert_eq "3" "$(new_commits_since "$rg_before")" "and each approved issue produced its commit"
+  assert_contains "$OUT" "FINAL REPORT" "the run reaches its final report"
+  assert_not_contains "$OUT" "command not found" "nothing on the path of the run reached for a missing binary"
+}
 
 case_commit_one_per_approved_issue() {
   standard_fixture commit-per-issue
@@ -1975,6 +2067,24 @@ case_commit_one_per_approved_issue() {
   (cd "$FIX" && git show --stat --format= HEAD) > "$TMP/last-commit.txt"
   assert_contains "$TMP/last-commit.txt" "impl-slice-3.txt" "the commit covers the work of that issue"
   assert_not_contains "$TMP/last-commit.txt" "impl-slice-1.txt" "and only of that issue"
+}
+
+# RF-35c: a commit exists only after the active gates went green. An issue that
+# ran and failed leaves nothing in the history, and neither does one that never
+# ran at all because it sits behind the failure.
+case_commit_failed_and_blocked_produce_none() {
+  graph_fixture commit-none \
+    "1|A, the one that fails|nenhum|não publicada" \
+    "2|B, behind the failure|Slice 1|não publicada"
+  reset_engine_counters
+  cn_before=$(head_rev)
+
+  MOCK_SCENARIO=noop run_loop --max-cycles 1
+  assert_ne "0" "$RC" "the failed issue makes the run exit non-zero"
+  assert_matches "$(state_dir)/progress.tsv" "^1${TAB}[0-9a-f]{64}${TAB}failed${TAB}" "the executed issue is recorded failed"
+  assert_matches "$(state_dir)/progress.tsv" "^2${TAB}[0-9a-f]{64}${TAB}blocked${TAB}" "the issue behind it is recorded blocked"
+  assert_eq "0" "$(new_commits_since "$cn_before")" "neither a failed nor a blocked issue produces a commit"
+  assert_eq "$cn_before" "$(head_rev)" "HEAD is exactly where it was before the run"
 }
 
 # RF-35d: green gates with a clean work tree means the issue was already
@@ -2041,6 +2151,19 @@ case_exit_code_matrix() {
   run_loop
   assert_eq "0" "$RC" "blocked-external as the only anomaly: exit 0"
   assert_contains "$OUT" "Externally blocked issues never change the exit code." "the report says the external block is not a failure"
+
+  # The fourth outcome: `blocked`. It only ever arises behind something else,
+  # and behind an external block there is no `failed` anywhere in the run — so
+  # a run whose anomalies are `blocked` and `blocked-external` still exits 0.
+  graph_fixture exit-matrix-blocked \
+    "1|Ready|nenhum|não publicada" \
+    "2|Waiting on the world|#999|não publicada" \
+    "3|Behind the external block|Slice 2|não publicada"
+  reset_engine_counters
+  run_loop
+  assert_eq "0" "$RC" "blocked and blocked-external as the only anomalies: exit 0"
+  assert_matches "$(state_dir)/progress.tsv" "^3${TAB}[0-9a-f]{64}${TAB}blocked${TAB}" "the transitively blocked issue is recorded blocked"
+  assert_eq "0" "$(grep -c "${TAB}failed${TAB}" "$(state_dir)/progress.tsv")" "and no issue of this run ended failed"
 }
 
 # UI-04 / RF-34: the final report groups every issue by state and points at the
@@ -2127,6 +2250,7 @@ case_graph_blocking_propagates_transitively
 case_graph_body_prose_heading_is_never_parsed
 case_graph_issue_number_blocker_matching_a_slice_is_an_edge
 case_graph_failure_propagates_transitively
+case_graph_keep_going_runs_an_independent_branch
 case_graph_prose_heading_is_not_a_parsing_source
 case_gate_engine_exit_zero_without_writing_fails_the_issue
 case_gate_red_suite_fails_then_the_correction_cycle_makes_one_commit
@@ -2135,7 +2259,11 @@ case_gate_verifier_count_divergence_is_red
 case_gate_verifier_zero_parsed_lines_is_red
 case_gate_verifier_incomplete_then_done
 case_usage_limit_waits_and_reruns_the_same_issue
+case_gate_zero_gates_records_unverified_and_reruns
+case_resume_two_consecutive_runs_are_idempotent
+case_run_completes_with_gh_absent
 case_commit_one_per_approved_issue
+case_commit_failed_and_blocked_produce_none
 case_already_implemented_issue_leaves_head_untouched
 case_sessions_are_never_reused
 case_exit_code_matrix
