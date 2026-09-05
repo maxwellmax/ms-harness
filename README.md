@@ -8,6 +8,13 @@ The unit of work is the **issue** — never a phase. Every command below produce
 consumes issues, and nothing in the harness is bound to a language, framework,
 runtime or package manager.
 
+> **Origin.** ms-harness is an adaptation of the
+> [Beer and Code Harness (`bc-harness`)](https://github.com/beerandcodeteam/beer-and-code-harness)
+> 0.2.0, MIT-licensed, © Beer and Code. It mirrors that harness's command surface
+> and rewrites its unit of work from the phase to the issue — see
+> [Delta from the mirrored harness](#delta-from-the-mirrored-harness). Both
+> copyright notices are kept in [LICENSE](LICENSE).
+
 ## Requirements
 
 | Dependency | Status | If missing |
@@ -473,7 +480,9 @@ is silent drift, and `check-drift.sh` is what makes drift loud.
 
 ## Delta from the mirrored harness
 
-ms-harness mirrors the surface of `bc-harness` 0.2.0 and changes three things
+ms-harness mirrors the surface of
+[`bc-harness`](https://github.com/beerandcodeteam/beer-and-code-harness) 0.2.0 —
+the Beer and Code Harness, MIT, © Beer and Code — and changes three things
 that blocked reuse outside that harness's home stack.
 
 **The unit of work is the issue, not the phase.** `bc-harness` plans into a phase
@@ -511,4 +520,6 @@ code is never a completion verdict.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). The file carries two copyright notices: this
+harness's, and that of `bc-harness` (© Beer and Code), the MIT-licensed work
+these sources are derived from.
