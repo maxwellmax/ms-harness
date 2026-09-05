@@ -1,0 +1,10 @@
+{
+  "name": "ms-harness",
+  "version": "0.1.0",
+  "description": "Issue-driven, stack-agnostic harness — planning pipeline, context generator, init chain, and an AFK execution loop whose unit of work is the issue.",
+  "author": {
+    "name": "maxwell",
+    "email": "maxwellgti@hotmail.com"
+  },
+  "license": "MIT"
+}
