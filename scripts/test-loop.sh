@@ -1914,7 +1914,7 @@ case_gate_verifier_session_is_read_only() {
   single_fixture gate-readonly
   reset_engine_counters
 
-  run_loop
+  run_loop --engine codex
   assert_eq "0" "$RC" "the run completes"
   assert_contains "$TMP/mockstate/verify_args" "sandbox=read-only" "the codex verifier session runs read-only"
   assert_not_contains "$TMP/mockstate/impl_args" "sandbox=read-only" "the implementation session is not the read-only one"
