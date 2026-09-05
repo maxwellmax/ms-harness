@@ -2319,14 +2319,14 @@ case_conformance_planted_violation_goes_red() {
 # at commands/ and agents/ — scripts/ is where the loop's git writes live.
 case_conformance_exclusion_set_and_ac06_scope() {
   new_fixture conformance-scope
-  for entry in '.git/' '.spec/' 'scripts/check-conformance.sh' 'README.md' 'CHANGELOG.md'; do
+  for entry in '.git/' '.spec/' 'scripts/check-conformance.sh' 'README.md' 'CHANGELOG.md' 'LICENSE'; do
     assert_contains "$CHECK_CONFORMANCE" "#   $entry" "the header names the exclusion '$entry'"
   done
   assert_contains "$CHECK_CONFORMANCE" "Nothing else is excluded." "the exclusion set is declared closed"
 
   # The runtime filter applies exactly those five and nothing more.
   grep -n 'continue ;;' "$CHECK_CONFORMANCE" | grep -F '.git/*' > "$OUT" 2>&1
-  assert_contains "$OUT" '.git/* | .spec/* | "$SELF" | README.md | CHANGELOG.md' \
+  assert_contains "$OUT" '.git/* | .spec/* | "$SELF" | README.md | CHANGELOG.md | LICENSE' \
     "the filter excludes exactly the named set"
 
   assert_contains "$CHECK_CONFORMANCE" 'commands/* | agents/*' "AC-06 is scoped to commands/ and agents/"

@@ -36,6 +36,9 @@
 #   README.md                    root documentation: its prose may name the
 #                                removed coupling
 #   CHANGELOG.md                 root documentation, same reason
+#   LICENSE                      root documentation, same reason: the MIT
+#                                attribution names the harness this one is
+#                                derived from
 #
 # Nothing else is excluded. In particular `scripts/test-loop.sh` is INSIDE the
 # surface: a test file that names the coupling it forbids is drift like any
@@ -128,7 +131,7 @@ SURFACE=""
 while IFS= read -r f; do
   [ -n "$f" ] || continue
   case "$f" in
-    .git/* | .spec/* | "$SELF" | README.md | CHANGELOG.md) continue ;;
+    .git/* | .spec/* | "$SELF" | README.md | CHANGELOG.md | LICENSE) continue ;;
   esac
   [ -f "$f" ] || continue
   SURFACE="$SURFACE$f
@@ -160,7 +163,7 @@ EOF
 }
 
 echo "ms-harness conformance — $SURFACE_COUNT files on the surface"
-echo "exclusion set: .git/ .spec/ $SELF README.md CHANGELOG.md"
+echo "exclusion set: .git/ .spec/ $SELF and the root documentation files"
 
 # ---------------------------------------------------------------------------
 # AC-01 — packaging and namespace (RF-01, RF-02, RF-03, UI-01)
