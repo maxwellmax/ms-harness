@@ -80,7 +80,7 @@ A SPEC whose Contracts subsection holds only markdown or manifest **format** con
 The router passed `architecture_reference_status: missing` → the absence goes **into the artifact**, never only into the return value:
 
 - `## Request Summary` records `Architecture references: missing`.
-- `## Open Questions` carries an explicit entry naming the absent source and the command that produces it: run `ms-harness:ai-context` to generate the AGENTS tree, or confirm that this repository has none.
+- `## Open Questions` carries an explicit entry naming the absent source, written with this exact literal: `Missing architecture guidance source — run ms-harness:context-map to produce the AGENTS tree, or confirm that this repository has none.`
 - The return summary states that the decomposition is **not** architecture-validated.
 
 Never present the output as architecture-validated when no reference was resolved, and never plan in silence around the gap.
@@ -103,7 +103,7 @@ Never present the output as architecture-validated when no reference was resolve
 - **No git write command, ever** — nothing that stages, records, stashes, switches, resets, publishes, tags or names a ref, and no commit created by any other means. Read-only git probes are fine; producing history is not this agent's job.
 - No implementation diffs — decomposition output only.
 - Writes go ONLY under `.spec/features/[slug]/` — never `src/`, never a repo-root contract file.
-- Delegation is always written plugin-namespaced: `ms-harness:specifier`, `ms-harness:clarifier`, `ms-harness:issuer`, `ms-harness:issue-verifier`, `ms-harness:ai-context`.
+- Delegation is always written plugin-namespaced: `ms-harness:specifier`, `ms-harness:clarifier`, `ms-harness:issuer`, `ms-harness:issue-verifier`, `ms-harness:context-map`.
 
 ## Self-check before returning
 

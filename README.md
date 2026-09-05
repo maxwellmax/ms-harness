@@ -60,7 +60,7 @@ The plugin ships exactly these commands. There is no unlisted embedded command.
 | Command | What it does | Writes |
 |---|---|---|
 | `/ms-harness:spec` | Planning pipeline for one feature | `.spec/features/<slug>/` |
-| `/ms-harness:ai-context` | Generates or refreshes the AGENTS context tree | `AGENTS.md`, `CLAUDE.md`, `docs/agents/*.md` |
+| `/ms-harness:context-map` | Generates or refreshes the AGENTS context tree | `AGENTS.md`, `CLAUDE.md`, `docs/agents/*.md` |
 | `/ms-harness:init` | Reports the state of the init spec chain and runs its next step | nothing (router) |
 | `/ms-harness:init:project-description` | Interviews the developer into a project description | `.spec/init/project-description.md` |
 | `/ms-harness:init:user-stories` | Derives testable user stories | `.spec/init/user-stories.md` |
@@ -93,10 +93,10 @@ Its closing report lists one line per artifact with `created` / `updated` /
 `reused` / `skipped`, the count of unresolved markers, and a handoff line
 pointing at `ISSUES.md` and at the loop invocation.
 
-### `/ms-harness:ai-context`
+### `/ms-harness:context-map`
 
 ```
-/ms-harness:ai-context [path] [+file] [-file] [--adopt]
+/ms-harness:context-map [path] [+file] [-file] [--adopt]
 ```
 
 Keeps the canonical AGENTS context tree in sync with the target repository's
@@ -116,9 +116,9 @@ considered.
 
 The command documents reality, not intent: source code, manifests, CI config and
 configs are the only sources of truth, and planning artifacts (`.spec/`) are
-never read. It delegates to three agents — `ms-harness:ai-context-inspector`
-(read-only sweep producing a digest), then `ms-harness:ai-context-core` and
-`ms-harness:ai-context-docs` writing in parallel from that digest.
+never read. It delegates to three agents — `ms-harness:context-map-inspector`
+(read-only sweep producing a digest), then `ms-harness:context-map-core` and
+`ms-harness:context-map-docs` writing in parallel from that digest.
 
 Every generated file carries an ownership banner on line 3. Runs are idempotent
 upserts: content is diffed against the bytes on disk and only changed artifacts
@@ -455,7 +455,7 @@ git init
 7. **Document what was built.**
 
    ```
-   /ms-harness:ai-context
+   /ms-harness:context-map
    ```
 
 ## Repository sanity checks
@@ -513,10 +513,14 @@ names git as a hard precondition and commits once per completed issue. Publishin
 to a tracker is likewise narrowed — creation only, destination resolved at run
 time from `gh repo view`, never an embedded `owner/repo`.
 
-Kept as they were: the `/ms-harness:spec` pipeline shape, `/ai-context` and its ten
-artifacts, the init chain with its `sha256` staleness stamps, one fresh session
-per unit of work, zero questions during a run, and the rule that the engine exit
-code is never a completion verdict.
+**The context tree pipeline is invoked as `/ms-harness:context-map`.** The command
+file, its three agents and the ownership banner they stamp all carry that name; the
+ten artifacts it writes, and the way it writes them, are unchanged.
+
+Kept as they were: the `/ms-harness:spec` pipeline shape, the ten canonical
+artifacts and their ownership banner, the init chain with its `sha256` staleness
+stamps, one fresh session per unit of work, zero questions during a run, and the
+rule that the engine exit code is never a completion verdict.
 
 ## License
 

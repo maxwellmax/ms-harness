@@ -110,7 +110,7 @@ Present `summary`, the ACs (drafted ones flagged), `slug`, `tier` and `parent_is
 Resolve the reference set with the first rule that matches:
 
 1. `AGENTS.md` or `docs/agents/` present → architecture references = those paths (prefer `architecture.md` + `domain_rules.md`). Status: the resolved paths.
-2. Absent but `.github/copilot-instructions.md` present → use it as a fallback and warn: `legacy architecture source — run /ms-harness:ai-context to migrate`. Status: the fallback path, flagged legacy.
+2. Absent but `.github/copilot-instructions.md` present → use it as a fallback and warn: `legacy architecture source — run /ms-harness:context-map to migrate`. Status: the fallback path, flagged legacy.
 3. No architecture source at all → status is the literal flag `architecture_reference_status: missing`, whether or not the chain artifacts of §1 exist. Chain artifacts are auxiliary grounding; they are not an architecture reference.
 
 **Bare project — neither `.spec/` nor an AGENTS tree.** This is a supported entry point, never a failure. Do not plan around the gap in silence and do not decide for the developer. Present both options with `AskUserQuestion` and proceed **only after an explicit decision**:
@@ -120,7 +120,7 @@ Resolve the reference set with the first rule that matches:
 
   | Missing reference | Produced by |
   |---|---|
-  | `AGENTS.md`, `CLAUDE.md`, `docs/agents/*.md` | `/ms-harness:ai-context` |
+  | `AGENTS.md`, `CLAUDE.md`, `docs/agents/*.md` | `/ms-harness:context-map` |
   | `.spec/init/project-description.md` | `/ms-harness:init:project-description` |
   | `.spec/init/user-stories.md` | `/ms-harness:init:user-stories` |
   | `.spec/init/database-schema.md` | `/ms-harness:init:database-schema` |
@@ -301,7 +301,7 @@ The handoff always points at `ISSUES.md` and the loop invocation, and at nothing
 ## Rules
 
 - **Thin router** — no SPEC / PLAN / issue template content in this file; the agents own every shape.
-- **Delegate plugin-namespaced** — `ms-harness:specifier`, `ms-harness:clarifier`, `ms-harness:planner`, `ms-harness:issuer`, and `/ms-harness:ai-context` or `/ms-harness:init:*` when you point at a producing command. Never a bare name.
+- **Delegate plugin-namespaced** — `ms-harness:specifier`, `ms-harness:clarifier`, `ms-harness:planner`, `ms-harness:issuer`, and `/ms-harness:context-map` or `/ms-harness:init:*` when you point at a producing command. Never a bare name.
 - **Never write application code.** The pipeline writes only under `.spec/features/[slug]/`, and this router writes only under `.spec/features/[slug]/.handoff/` — the approval record, the resolved answers file, and nothing else.
 - **No git write command, ever** — nothing that stages, records, stashes, switches, resets, publishes, tags or names a ref, and no commit created by any other means. Read-only probes such as `git diff` and `git status` are fine. The developer reviews the diff and records history manually. The execution loop is a different program under `scripts/`, and this rule does not reach it.
 - **Create only in the tracker** — never close, reopen, relabel or edit an issue this run did not create, the parent included.

@@ -147,4 +147,4 @@ The size of this report grows with the number of criteria; it is consumed by the
 - Accept the previous session's summary as proof of anything.
 - Charge a criterion belonging to another slice or to the parent issue.
 - Invent a criterion the issue did not write.
-- Delegate to another harness agent under a bare name: `ms-harness:issuer`, `ms-harness:planner`, `ms-harness:specifier`, `ms-harness:clarifier` and `ms-harness:ai-context` are always written plugin-namespaced.
+- Delegate to another harness agent under a bare name: `ms-harness:issuer`, `ms-harness:planner`, `ms-harness:specifier`, `ms-harness:clarifier` and `ms-harness:context-map` are always written plugin-namespaced.

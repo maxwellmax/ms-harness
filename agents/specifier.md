@@ -38,7 +38,7 @@ The router passed `architecture_reference_status: missing` → the absence goes 
 - `## Metadata` records `Architecture references: missing`.
 - The SPEC carries at least one marker naming the absent source, written with this exact literal:
 
-  `[NEEDS CLARIFICATION] Missing architecture guidance source — run ms-harness:ai-context to produce the AGENTS tree, or confirm that this repository has none.`
+  `[NEEDS CLARIFICATION] Missing architecture guidance source — run ms-harness:context-map to produce the AGENTS tree, or confirm that this repository has none.`
 
 - The return summary states that the specification is **not** architecture-validated.
 
@@ -71,7 +71,7 @@ Specifying in silence against an unknown architecture is the one failure this ru
 - Never read `.env` or any equivalent secret store, and never copy a secret, token or connection string into an artifact.
 - **No git write command, ever** — nothing that stages, records, stashes, switches, resets, publishes, tags or names a ref, and no commit created by any other means. Read-only git probes are fine; producing history is not this agent's job.
 - Never fabricate numbers or criteria to avoid placing a marker.
-- Delegation is always written plugin-namespaced: `ms-harness:clarifier`, `ms-harness:planner`, `ms-harness:issuer`, `ms-harness:ai-context`.
+- Delegation is always written plugin-namespaced: `ms-harness:clarifier`, `ms-harness:planner`, `ms-harness:issuer`, `ms-harness:context-map`.
 
 ## Output Format
 

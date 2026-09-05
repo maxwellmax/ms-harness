@@ -123,7 +123,7 @@ Rules for the body:
 
 The router passed `architecture_reference_status: missing` → the absence goes **into the artifact**: the metadata block of `ISSUES.md` carries
 
-`- **Arquitetura**: missing — slices cut without an architecture reference; run ms-harness:ai-context to produce the AGENTS tree.`
+`- **Arquitetura**: Missing architecture guidance source — run ms-harness:context-map to produce the AGENTS tree, or confirm that this repository has none.`
 
 and the return summary says the slicing is not architecture-validated. Never cut slices in silence around the gap.
 
@@ -232,7 +232,7 @@ for each issue created in this run. Report any that failed. Return a summary of 
 - **No git write command, ever** — nothing that stages, records, stashes, switches, resets, publishes, tags or names a ref, and no commit created by any other means. Read-only git probes are fine; producing history is not this agent's job.
 - Never read `.env` or any equivalent secret store, and never paste a secret, token or connection string into an issue body, a metadata field or a log line.
 - Never invent an acceptance criterion with no backing in PLAN.md or SPEC.md — a gap is reported, not filled.
-- Delegation is always written plugin-namespaced: `ms-harness:specifier`, `ms-harness:clarifier`, `ms-harness:planner`, `ms-harness:issue-verifier`, `ms-harness:ai-context`.
+- Delegation is always written plugin-namespaced: `ms-harness:specifier`, `ms-harness:clarifier`, `ms-harness:planner`, `ms-harness:issue-verifier`, `ms-harness:context-map`.
 - Output: summaries only — never inline an issue body back to the router, and never exceed 200 bytes. Anything larger travels as a file path.
 
 ## Output Format — `.spec/features/[slug]/ISSUES.md`

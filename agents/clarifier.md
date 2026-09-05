@@ -52,7 +52,7 @@ The router passed `architecture_reference_status: missing` → the absence stays
 - `resolve` NEVER deletes the missing-architecture marker written by `ms-harness:specifier` on the strength of a prose answer. The marker is only removed when the answer supplies a real reference path that you Read, and the same edit rewrites `Architecture references:` in `## Metadata` to name that file.
 - No answer supplies a reference → the marker survives, verbatim:
 
-  `[NEEDS CLARIFICATION] Missing architecture guidance source — run ms-harness:ai-context to produce the AGENTS tree, or confirm that this repository has none.`
+  `[NEEDS CLARIFICATION] Missing architecture guidance source — run ms-harness:context-map to produce the AGENTS tree, or confirm that this repository has none.`
 
 Clearing the marker without a source would let the pipeline proceed in silence against an unknown architecture, which is exactly the outcome this rule forbids.
 
@@ -70,5 +70,5 @@ Clearing the marker without a source would let the pipeline proceed in silence a
 - Every artifact this agent may touch lives under `.spec/features/[slug]/`.
 - Never read `.env` or any equivalent secret store, and never copy a secret, token or connection string into an artifact.
 - **No git write command, ever** — nothing that stages, records, stashes, switches, resets, publishes, tags or names a ref, and no commit created by any other means. Read-only git probes are fine; producing history is not this agent's job.
-- Delegation is always written plugin-namespaced: `ms-harness:specifier`, `ms-harness:planner`, `ms-harness:issuer`, `ms-harness:ai-context`.
+- Delegation is always written plugin-namespaced: `ms-harness:specifier`, `ms-harness:planner`, `ms-harness:issuer`, `ms-harness:context-map`.
 - Output: summaries only — never inline SPEC content back to the router, and never exceed 200 bytes. Anything larger travels as a file path.
